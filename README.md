@@ -8,18 +8,22 @@ control, and signal handling.
 
 ## Current Status
 
-**Update 2 complete (operator-aware tokenization + parsing model)**
+**Update 3 complete (I/O redirection execution)**
 
 The shell currently supports:
 - An interactive read–eval–print loop
 - Operator-aware tokenization for: `|`, `<`, `>`, `>>`, `&`
 - Parsing into a structured command model (pipeline stages + redirection metadata + background flag)
 - Builtin commands (`cd`, `exit`)
-- Execution of simple external commands using `fork`, `execvp`, and `waitpid`
+- Execution of external commands using `fork`, `execvp`, and `waitpid`
+- Input/output redirection for a single command using `open` + `dup2`:
+  - stdin redirection: `<`
+  - stdout redirection: `>`
+  - stdout append: `>>`
 - Clean build system using `make`
 
-> Note: Operator execution (pipes/redirection/background) is parsed but not executed yet.
-> Execution will be implemented in the next milestones.
+> Note: Pipelines (`|`) and background execution (`&`) are parsed but not executed yet.
+> These will be implemented soon.
 
 ## Features (Implemented)
 
@@ -27,13 +31,24 @@ The shell currently supports:
 - Displays a prompt and reads user input line-by-line
 - Gracefully exits on EOF (`Ctrl-D`) or `exit`
 
-### Tokenization + Parsing (Update 2)
+### Tokenization + Parsing
 - Recognizes operators as separate tokens (including `>>` as one token)
 - Parses command lines into a structured model:
   - pipeline of command stages
   - per-stage redirection fields (`<`, `>`, `>>`)
   - trailing background indicator (`&`)
 - Detects and reports basic syntax errors (e.g., missing command, missing redirection filename)
+
+### Redirection Execution
+- Executes a single parsed command with I/O redirection:
+  - `cmd < input.txt`
+  - `cmd > output.txt`
+  - `cmd >> output.txt`
+- Implements redirection in the child process prior to `execvp()`:
+  - opens files with `open()`
+  - rewires file descriptors with `dup2()`
+  - closes original descriptors after duplication
+- Reports file/permission errors cleanly and returns to the prompt
 
 ### Builtins
 - `cd [dir]`
@@ -42,24 +57,10 @@ The shell currently supports:
 - `exit`
   - Terminates the shell cleanly
 
-### External Commands (Update 1 behavior)
+### External Commands
 - Uses `fork()` to create a child process
 - Replaces the child process image with `execvp()`
 - Parent waits for completion using `waitpid()`
 - Proper error reporting on failed execution
 
----
 
-## Future Updates
-
-The following milestones are planned and tracked explicitly:
-
-- **Update 3**: Input/output redirection execution (`<`, `>`, `>>`)
-- **Update 4**: Pipelines with arbitrary length (`a | b | c`)
-- **Update 5**: Background jobs (`&`) and job table
-- **Update 6**: Process groups and terminal control (`setpgid`, `tcsetpgrp`)
-- **Update 7**: Signal handling (`SIGCHLD`, `SIGINT`, `SIGTSTP`)
-- **Update 8–9**: Full job control (`jobs`, `fg`, `bg`)
-
-The final goal is a shell that behaves correctly with respect to Unix job
-control semantics.

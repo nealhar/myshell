@@ -35,7 +35,7 @@ public:
     // true if output uses append (">>"), false if truncate (">")
     bool append = false;
 
-    // helper methods (not required, but nice)
+    // helper methods
     bool has_stdin() const;
     bool has_stdout() const;
 };
@@ -58,7 +58,7 @@ public:
 // on error, err_msg contains a human readable message
 bool parse_command_line(const std::vector<std::string>& tokens, CommandLine& out, std::string& err_msg);
 
-// helper to detect if milestone 2 features (operators) are present
+// helper to detect if operators are present
 bool contains_operators(const std::vector<std::string>& tokens);
 
 // returns true if command is builtin like cd or exit
@@ -67,7 +67,11 @@ bool is_builtin(const std::vector<std::string>& tokens);
 // executes built in command inside shell process, 0 for success, -1 if exit, >0 if error
 int run_builtin(const std::vector<std::string>& tokens);
 
-// executes non built in command using fork and execvp, shell waits for child to finish
+// executes a single parsed command supporting operators
+// uses fork + dup2 + execvp
+int run_command(const Command& cmd);
+
+// legacy -- does not support redirection
 int run_external(const std::vector<std::string>& tokens);
 
 // waits for child

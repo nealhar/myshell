@@ -7,6 +7,9 @@
 #include <iostream>
 #include <sstream>
 
+// needed for open() flags
+#include <fcntl.h>
+
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -76,7 +79,7 @@ std::vector<std::string> tokenize_operators(const std::string& line) {
                 i++;
             } else {
                 // single char operator
-                tokens.push_back(std::string(1,c));
+                tokens.push_back(std::string(1, c));
             }
             continue;
         }
@@ -112,7 +115,7 @@ bool Command::has_stdout() const {
 }
 
 bool CommandLine::is_pipeline() const {
-    // true if more than one command stage exists
+    // true if more than one command exists
     return pipeline.size() > 1;
 }
 
@@ -330,7 +333,101 @@ int wait_for_child(int pid) {
     return 1;
 }
 
-// run external command
+// run a single command with redirection
+int run_command(const Command& cmd) {
+    // if no program name exists then return error
+    if (cmd.argv.empty()) {
+        std::cerr << "myshell: empty command\n";
+        return 1;
+    }
+
+    // fork to create a child process
+    pid_t pid = fork();
+
+    // if fork fails
+    if (pid < 0) {
+        std::cerr << "fork: " << std::strerror(errno) << "\n";
+        return 1;
+    }
+
+    // if we are in the child process
+    if (pid == 0) {
+        // apply <
+        if (cmd.has_stdin()) {
+            // open input file as read-only
+            int fd = open(cmd.stdin_file.c_str(), O_RDONLY);
+
+            // if open fails, print error and exit child
+            if (fd < 0) {
+                std::cerr << cmd.stdin_file << ": " << std::strerror(errno) << "\n";
+                _exit(1);
+            }
+
+            // duplicate fd onto stdin (fd 0)
+            if (dup2(fd, STDIN_FILENO) < 0) {
+                std::cerr << "dup2: " << std::strerror(errno) << "\n";
+                close(fd);
+                _exit(1);
+            }
+
+            // close original fd after dup2
+            close(fd);
+        }
+
+        // apply > or >>
+        if (cmd.has_stdout()) {
+            // choose flags based on append vs truncate
+            int flags = O_WRONLY | O_CREAT;
+
+            // >> means append, > means truncate
+            if (cmd.append) {
+                flags |= O_APPEND;
+            } else {
+                flags |= O_TRUNC;
+            }
+
+            // open output file with mode 0644 (rw-r--r--)
+            int fd = open(cmd.stdout_file.c_str(), flags, 0644);
+
+            // if open fails, print error and exit child
+            if (fd < 0) {
+                std::cerr << cmd.stdout_file << ": " << std::strerror(errno) << "\n";
+                _exit(1);
+            }
+
+            // duplicate fd onto stdout (fd 1)
+            if (dup2(fd, STDOUT_FILENO) < 0) {
+                std::cerr << "dup2: " << std::strerror(errno) << "\n";
+                close(fd);
+                _exit(1);
+            }
+
+            // close original fd after dup2
+            close(fd);
+        }
+
+        // build argv for execvp from cmd.argv
+        std::vector<char*> argv;
+        for (const std::string& s : cmd.argv) {
+            argv.push_back(const_cast<char*>(s.c_str()));
+        }
+        argv.push_back(nullptr);
+
+        // run program
+        execvp(argv[0], argv.data());
+
+        // if execvp returns, an error occurred
+        std::cerr << cmd.argv[0] << ": " << std::strerror(errno) << "\n";
+
+        // exit child immediately
+        _exit(127);
+    }
+
+    // parent waits for child
+    return wait_for_child(pid);
+}
+
+// not used anymore, legacy for simple commands
 int run_external(const std::vector<std::string>& tokens) {
     // if empty return
     if (tokens.empty()) return 0;
