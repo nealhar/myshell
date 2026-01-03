@@ -427,6 +427,181 @@ int run_command(const Command& cmd) {
     return wait_for_child(pid);
 }
 
+// run the pipeline
+int run_pipeline(const CommandLine& cmdline) {
+    // if pipeline is empty then return
+    if (cmdline.pipeline.empty()) return 0;
+
+    // number of commands in the pipeline
+    size_t n = cmdline.pipeline.size();
+
+    // if there is only one command, just run it normally
+    if (n == 1) {
+        return run_command(cmdline.pipeline[0]);
+    }
+
+    // validate redirection rules :
+    // - only first command can have stdin redirection
+    // - only last command can have stdout redirection
+    for (size_t i = 0; i < n; i++) {
+        if (i != 0 && cmdline.pipeline[i].has_stdin()) {
+            std::cerr << "myshell: input redirection only allowed on first pipeline stage\n";
+            return 1;
+        }
+        if (i != n - 1 && cmdline.pipeline[i].has_stdout()) {
+            std::cerr << "myshell: output redirection only allowed on last pipeline stage\n";
+            return 1;
+        }
+    }
+
+    // store all child pids so parent can wait for all of them
+    std::vector<pid_t> pids;
+
+    // previous pipe read end (for stdin of current command)
+    int prev_read = -1;
+
+    // create each stage of the pipeline
+    for (size_t i = 0; i < n; i++) {
+
+        // create a new pipe for this stage to the next stage
+        // last stage does not need a pipe
+        int pipefd[2] = {-1, -1};
+        if (i < n - 1) {
+            if (pipe(pipefd) < 0) {
+                std::cerr << "pipe: " << std::strerror(errno) << "\n";
+                return 1;
+            }
+        }
+
+        // fork a child for this stage
+        pid_t pid = fork();
+
+        // fork failed
+        if (pid < 0) {
+            std::cerr << "fork: " << std::strerror(errno) << "\n";
+            return 1;
+        }
+
+        // child process
+        if (pid == 0) {
+
+            // if this is not the first stage, connect stdin to prev_read
+            if (i > 0) {
+                if (dup2(prev_read, STDIN_FILENO) < 0) {
+                    std::cerr << "dup2: " << std::strerror(errno) << "\n";
+                    _exit(1);
+                }
+            }
+
+            // if this is not the last stage, connect stdout to pipe write end
+            if (i < n - 1) {
+                if (dup2(pipefd[1], STDOUT_FILENO) < 0) {
+                    std::cerr << "dup2: " << std::strerror(errno) << "\n";
+                    _exit(1);
+                }
+            }
+
+            // close fds that are no longer needed after dup2
+            if (prev_read != -1) close(prev_read);
+            if (pipefd[0] != -1) close(pipefd[0]);
+            if (pipefd[1] != -1) close(pipefd[1]);
+
+            // apply input redirection on first stage
+            if (i == 0 && cmdline.pipeline[i].has_stdin()) {
+                int fd = open(cmdline.pipeline[i].stdin_file.c_str(), O_RDONLY);
+                if (fd < 0) {
+                    std::cerr << cmdline.pipeline[i].stdin_file << ": " << std::strerror(errno) << "\n";
+                    _exit(1);
+                }
+                if (dup2(fd, STDIN_FILENO) < 0) {
+                    std::cerr << "dup2: " << std::strerror(errno) << "\n";
+                    close(fd);
+                    _exit(1);
+                }
+                close(fd);
+            }
+
+            // apply output redirection on last stage
+            if (i == n - 1 && cmdline.pipeline[i].has_stdout()) {
+                int flags = O_WRONLY | O_CREAT;
+                if (cmdline.pipeline[i].append) {
+                    flags |= O_APPEND;
+                } else {
+                    flags |= O_TRUNC;
+                }
+
+                int fd = open(cmdline.pipeline[i].stdout_file.c_str(), flags, 0644);
+                if (fd < 0) {
+                    std::cerr << cmdline.pipeline[i].stdout_file << ": " << std::strerror(errno) << "\n";
+                    _exit(1);
+                }
+                if (dup2(fd, STDOUT_FILENO) < 0) {
+                    std::cerr << "dup2: " << std::strerror(errno) << "\n";
+                    close(fd);
+                    _exit(1);
+                }
+                close(fd);
+            }
+
+            // build argv for execvp
+            const Command& cmd = cmdline.pipeline[i];
+            if (cmd.argv.empty()) {
+                std::cerr << "myshell: empty command\n";
+                _exit(1);
+            }
+
+            std::vector<char*> argv;
+            for (const std::string& s : cmd.argv) {
+                argv.push_back(const_cast<char*>(s.c_str()));
+            }
+            argv.push_back(nullptr);
+
+            // exec the command
+            execvp(argv[0], argv.data());
+
+            // if exec returns, print error
+            std::cerr << cmd.argv[0] << ": " << std::strerror(errno) << "\n";
+            _exit(127);
+        }
+
+        // parent process
+        pids.push_back(pid);
+
+        // parent no longer needs prev_read (it was used for this stage)
+        if (prev_read != -1) {
+            close(prev_read);
+            prev_read = -1;
+        }
+
+        // parent keeps read end of current pipe for next stage
+        // parent closes write end immediately
+        if (i < n - 1) {
+            close(pipefd[1]);
+            prev_read = pipefd[0];
+        }
+    }
+
+    // parent: after spawning all children, close any remaining pipe read end
+    if (prev_read != -1) {
+        close(prev_read);
+        prev_read = -1;
+    }
+
+    // wait for all children, return status of last stage
+    int last_status = 0;
+
+    for (size_t i = 0; i < pids.size(); i++) {
+        int rc = wait_for_child(pids[i]);
+
+        // store status of the last command in the pipeline
+        if (i == pids.size() - 1) {
+            last_status = rc;
+        }
+    }
+
+    return last_status;
+}
+
 // not used anymore, legacy for simple commands
 int run_external(const std::vector<std::string>& tokens) {
     // if empty return

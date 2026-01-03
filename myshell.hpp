@@ -67,9 +67,13 @@ bool is_builtin(const std::vector<std::string>& tokens);
 // executes built in command inside shell process, 0 for success, -1 if exit, >0 if error
 int run_builtin(const std::vector<std::string>& tokens);
 
-// executes a single parsed command supporting operators
+// executes a single parsed command supporting redirection
 // uses fork + dup2 + execvp
 int run_command(const Command& cmd);
+
+// executes a parsed pipeline supporting pipes and end redirection
+// uses pipe + fork + dup2 + execvp
+int run_pipeline(const CommandLine& cmdline);
 
 // legacy -- does not support redirection
 int run_external(const std::vector<std::string>& tokens);

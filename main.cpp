@@ -28,6 +28,7 @@ int main() {
         }
 
         // if the command is built in then run it in the shell process
+        // builtins are only supported for simple commands in this project phase
         if (is_builtin(tokens)) {
             int rc = run_builtin(tokens);
 
@@ -48,19 +49,19 @@ int main() {
             continue;
         }
 
-        // if user used background token, note it but do not execute yet -- will implement later
+        // background execution will be implemented later
         if (cmdline.background) {
             std::cerr << "myshell: background execution not implemented yet\n";
             continue;
         }
 
-        // if command line is a pipeline do not execute yet -- will implement later
+        // if pipeline then run pipeline
         if (cmdline.is_pipeline()) {
-            std::cerr << "myshell: pipelines not implemented yet\n";
+            run_pipeline(cmdline);
             continue;
         }
 
-        // run command
+        // run single command
         if (cmdline.pipeline.empty()) {
             // should not happen if parser is correct, but keep a failsafe
             std::cerr << "myshell: internal error: no command to run\n";

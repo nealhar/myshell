@@ -8,22 +8,28 @@ control, and signal handling.
 
 ## Current Status
 
-**Update 3 complete (I/O redirection execution)**
+**Update 4 complete (pipelines + end redirection)**
 
 The shell currently supports:
 - An interactive read–eval–print loop
 - Operator-aware tokenization for: `|`, `<`, `>`, `>>`, `&`
 - Parsing into a structured command model (pipeline stages + redirection metadata + background flag)
-- Builtin commands (`cd`, `exit`)
+- Builtin commands (`cd`, `exit`) for simple commands
 - Execution of external commands using `fork`, `execvp`, and `waitpid`
-- Input/output redirection for a single command using `open` + `dup2`:
+- Input/output redirection using `open` + `dup2`:
   - stdin redirection: `<`
   - stdout redirection: `>`
   - stdout append: `>>`
+- Pipelines of arbitrary length using `pipe` + `dup2`:
+  - `a | b`
+  - `a | b | c`
+- Redirection at pipeline ends (simplified rules):
+  - `<` allowed only on the first stage
+  - `>` / `>>` allowed only on the last stage
 - Clean build system using `make`
 
-> Note: Pipelines (`|`) and background execution (`&`) are parsed but not executed yet.
-> These will be implemented soon.
+> Note: Background execution (`&`) is parsed but not executed yet.
+> Full job control (process groups, terminal control, signals, `jobs/fg/bg`) will be implemented later on
 
 ## Features (Implemented)
 
@@ -49,6 +55,19 @@ The shell currently supports:
   - rewires file descriptors with `dup2()`
   - closes original descriptors after duplication
 - Reports file/permission errors cleanly and returns to the prompt
+
+### Pipeline Execution
+- Executes pipelines with arbitrary length:
+  - `cmd1 | cmd2`
+  - `cmd1 | cmd2 | cmd3`
+- Creates `N-1` pipes for `N` stages and forks one process per stage
+- Connects stages using `dup2()`:
+  - stage `i` stdout → pipe write end
+  - stage `i+1` stdin → pipe read end
+- Closes unused pipe file descriptors in both parent and child processes to prevent hangs and ensure EOF propagates correctly
+- Supports end redirection on pipelines under simplified rules:
+  - `< file` only on the first stage
+  - `> file` / `>> file` only on the last stage
 
 ### Builtins
 - `cd [dir]`
