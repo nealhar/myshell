@@ -67,19 +67,22 @@ bool is_builtin(const std::vector<std::string>& tokens);
 // executes built in command inside shell process, 0 for success, -1 if exit, >0 if error
 int run_builtin(const std::vector<std::string>& tokens);
 
-// executes a single parsed command supporting redirection
-// uses fork + dup2 + execvp
-int run_command(const Command& cmd);
+// executes a single parsed command
+// if background == true, shell does not wait and child pid is returned via out_pid
+int run_command(const Command& cmd, bool background, int* out_pid);
 
-// executes a parsed pipeline supporting pipes and end redirection
-// uses pipe + fork + dup2 + execvp
-int run_pipeline(const CommandLine& cmdline);
+// executes a parsed pipeline
+// if background == true, shell does not wait and all stage pids are returned via out_pids
+int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* out_pids);
 
 // legacy -- does not support redirection
 int run_external(const std::vector<std::string>& tokens);
 
-// waits for child
+// waits for child (blocking)
 int wait_for_child(int pid);
 
 // builds argv array for execvp, must be null terminated
 std::vector<char*> build_argv(const std::vector<std::string>& tokens);
+
+// reap any finished background children (WNOHANG)
+void reap_background_jobs();

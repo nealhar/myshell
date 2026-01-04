@@ -8,6 +8,9 @@ int main() {
     // infinite loop
     while (true) {
 
+        // update 5: reap finished background processes before showing prompt
+        reap_background_jobs();
+
         // print the shell prompt
         print_prompt();
 
@@ -28,7 +31,7 @@ int main() {
         }
 
         // if the command is built in then run it in the shell process
-        // builtins are only supported for simple commands in this project phase
+        // builtins run in the shell process because they must modify shell state (like cd)
         if (is_builtin(tokens)) {
             int rc = run_builtin(tokens);
 
@@ -49,15 +52,18 @@ int main() {
             continue;
         }
 
-        // background execution will be implemented later
-        if (cmdline.background) {
-            std::cerr << "myshell: background execution not implemented yet\n";
-            continue;
-        }
-
-        // if pipeline then run pipeline
+        // if pipeline then run pipeline (foreground or background)
         if (cmdline.is_pipeline()) {
-            run_pipeline(cmdline);
+
+            // background pipeline: do not wait, record job
+            if (cmdline.background) {
+                std::vector<int> pids;
+                run_pipeline(cmdline, true, &pids);
+            } else {
+                // foreground pipeline: wait like normal
+                run_pipeline(cmdline, false, nullptr);
+            }
+
             continue;
         }
 
@@ -68,7 +74,14 @@ int main() {
             continue;
         }
 
-        run_command(cmdline.pipeline[0]);
+        // background single command: do not wait, record job
+        if (cmdline.background) {
+            int pid = -1;
+            run_command(cmdline.pipeline[0], true, &pid);
+        } else {
+            // foreground single command
+            run_command(cmdline.pipeline[0], false, nullptr);
+        }
     }
 
     return 0;

@@ -8,28 +8,26 @@ control, and signal handling.
 
 ## Current Status
 
-**Update 4 complete (pipelines + end redirection)**
+**Update 5 complete (background jobs + job table + reaping)**
 
 The shell currently supports:
 - An interactive read–eval–print loop
 - Operator-aware tokenization for: `|`, `<`, `>`, `>>`, `&`
 - Parsing into a structured command model (pipeline stages + redirection metadata + background flag)
-- Builtin commands (`cd`, `exit`) for simple commands
+- Builtin commands (`cd`, `exit`, `jobs`)
 - Execution of external commands using `fork`, `execvp`, and `waitpid`
 - Input/output redirection using `open` + `dup2`:
   - stdin redirection: `<`
   - stdout redirection: `>`
   - stdout append: `>>`
-- Pipelines of arbitrary length using `pipe` + `dup2`:
-  - `a | b`
-  - `a | b | c`
-- Redirection at pipeline ends (simplified rules):
-  - `<` allowed only on the first stage
-  - `>` / `>>` allowed only on the last stage
+- Pipelines of arbitrary length using `pipe` + `dup2`
+- Background execution with `&` for both single commands and pipelines
+- A simple job table tracking background jobs (job id, pids, command string, running/done)
+- Non-blocking child reaping using `waitpid(..., WNOHANG)` to prevent zombie processes
 - Clean build system using `make`
 
-> Note: Background execution (`&`) is parsed but not executed yet.
-> Full job control (process groups, terminal control, signals, `jobs/fg/bg`) will be implemented later on
+> Note: This update implements basic background launching and tracking.
+> Full job control semantics (process groups, terminal control, signal routing, and `fg/bg`) are planned for later milestones.
 
 ## Features (Implemented)
 
@@ -69,17 +67,31 @@ The shell currently supports:
   - `< file` only on the first stage
   - `> file` / `>> file` only on the last stage
 
+### Background Jobs + Job Table
+- Supports background execution with `&`:
+  - `sleep 5 &`
+  - `cmd1 | cmd2 &`
+- Does not block the shell prompt for background jobs
+- Maintains a job table tracking:
+  - job id (`[1]`, `[2]`, ...)
+  - process ids (single pid for commands, multiple pids for pipelines)
+  - original command string (best-effort)
+  - job state (`Running` / `Done`)
+- Reaps completed background children using `waitpid(-1, ..., WNOHANG)` to prevent zombie processes
+- Prints a completion notification when a job finishes
+- Includes a `jobs` builtin to list current jobs
+
 ### Builtins
 - `cd [dir]`
   - Changes the current working directory
   - Defaults to `$HOME` when no directory is provided
 - `exit`
   - Terminates the shell cleanly
+- `jobs`
+  - Lists tracked background jobs and their status
 
 ### External Commands
 - Uses `fork()` to create a child process
 - Replaces the child process image with `execvp()`
-- Parent waits for completion using `waitpid()`
+- Parent waits for completion using `waitpid()` for foreground jobs
 - Proper error reporting on failed execution
-
-

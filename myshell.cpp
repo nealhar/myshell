@@ -14,6 +14,95 @@
 #include <unistd.h>
 
 
+// ============================================================
+// update 5: job table
+// ============================================================
+
+// represents a background job
+class Job {
+public:
+    // numeric job id: 1, 2, 3, ...
+    int job_id = 0;
+
+    // list of process ids belonging to this job (pipelines have multiple)
+    std::vector<int> pids;
+
+    // the command line text (for display)
+    std::string cmd;
+
+    // true if job still running, false if fully finished
+    bool running = true;
+
+    // helper: check if a pid is part of this job
+    bool contains_pid(int pid) const {
+        for (int p : pids) {
+            if (p == pid) return true;
+        }
+        return false;
+    }
+
+    // helper: remove a pid when it has terminated
+    void remove_pid(int pid) {
+        for (size_t i = 0; i < pids.size(); i++) {
+            if (pids[i] == pid) {
+                pids.erase(pids.begin() + i);
+                break;
+            }
+        }
+        if (pids.empty()) {
+            running = false;
+        }
+    }
+};
+
+// global job table for this simple shell milestone
+static std::vector<Job> g_jobs;
+
+// next job id counter
+static int g_next_job_id = 1;
+
+// helper to build a display string for tokens (approx original command)
+static std::string join_tokens_for_display(const std::vector<std::string>& tokens) {
+    std::string s;
+    for (size_t i = 0; i < tokens.size(); i++) {
+        if (i) s += " ";
+        s += tokens[i];
+    }
+    return s;
+}
+
+// add a job to the job table and print its launch info
+static void add_job(const std::vector<int>& pids, const std::string& cmd) {
+    Job j;
+    j.job_id = g_next_job_id++;
+    j.pids = pids;
+    j.cmd = cmd;
+    j.running = true;
+
+    g_jobs.push_back(j);
+
+    // print job launch line similar to real shells
+    // choose the first pid as a representative id
+    int rep = (pids.empty() ? -1 : pids[0]);
+    std::cout << "[" << j.job_id << "] " << rep << "\n";
+}
+
+// print jobs builtin output
+static void print_jobs() {
+    // print each job state
+    for (const Job& j : g_jobs) {
+        if (j.running) {
+            std::cout << "[" << j.job_id << "] Running  " << j.cmd << "\n";
+        } else {
+            std::cout << "[" << j.job_id << "] Done     " << j.cmd << "\n";
+        }
+    }
+}
+
+// ============================================================
+// basic shell utilities
+// ============================================================
+
 void print_prompt() {
     // print prompt and flush output so it appears immediately
     std::cout << "myshell> " << std::flush;
@@ -237,8 +326,8 @@ bool is_builtin(const std::vector<std::string>& tokens) {
     // if tokens is empty then return false
     if (tokens.empty()) return false;
 
-    // will be extended later with other commands
-    return (tokens[0] == "cd" || tokens[0] == "exit");
+    // update 5: add "jobs" builtin to display background jobs
+    return (tokens[0] == "cd" || tokens[0] == "exit" || tokens[0] == "jobs");
 }
 
 // helper function for cd
@@ -281,6 +370,12 @@ int run_builtin(const std::vector<std::string>& tokens) {
         return builtin_cd(tokens);
     }
 
+    // jobs builtin
+    if (tokens[0] == "jobs") {
+        print_jobs();
+        return 0;
+    }
+
     // failsafe incase is_builtin is incorrect
     std::cerr << "Unknown builtin\n";
     return 1;
@@ -301,11 +396,11 @@ std::vector<char*> build_argv(const std::vector<std::string>& tokens) {
     return argv;
 }
 
-// waiting for child
+// waiting for child (blocking)
 int wait_for_child(int pid) {
     int status = 0;
 
-    // use wait pid syscall to wait for child
+    // use waitpid syscall to wait for child
     while (true) {
         pid_t w = waitpid(pid, &status, 0);
 
@@ -325,7 +420,7 @@ int wait_for_child(int pid) {
         return WEXITSTATUS(status);
     }
 
-    // sigint
+    // signaled exit
     if (WIFSIGNALED(status)) {
         return 128 + WTERMSIG(status);
     }
@@ -333,8 +428,60 @@ int wait_for_child(int pid) {
     return 1;
 }
 
+// update 5: reap finished background jobs using WNOHANG
+void reap_background_jobs() {
+    int status = 0;
+
+    // loop reaping until no more children have exited
+    while (true) {
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+
+        // no more finished children
+        if (pid == 0) {
+            break;
+        }
+
+        // error: no children or other issue
+        if (pid < 0) {
+            // if no child processes exist, this is normal in many shells
+            if (errno == ECHILD) {
+                break;
+            }
+            // other errors should be reported
+            std::cerr << "waitpid: " << std::strerror(errno) << "\n";
+            break;
+        }
+
+        // find which job this pid belongs to and mark it finished
+        for (Job& j : g_jobs) {
+            if (j.running && j.contains_pid(static_cast<int>(pid))) {
+                j.remove_pid(static_cast<int>(pid));
+
+                // if this was the last pid in the job, job is done
+                if (!j.running) {
+                    std::cout << "[" << j.job_id << "] Done     " << j.cmd << "\n";
+                }
+                break;
+            }
+        }
+    }
+
+    // optional cleanup: remove jobs that are done to keep list small
+    // keep it simple: leave them so "jobs" shows Done entries too
+}
+
+// helper: build argv for execvp from Command.argv
+static std::vector<char*> build_exec_argv(const Command& cmd) {
+    std::vector<char*> argv;
+    for (const std::string& s : cmd.argv) {
+        argv.push_back(const_cast<char*>(s.c_str()));
+    }
+    argv.push_back(nullptr);
+    return argv;
+}
+
 // run a single command with redirection
-int run_command(const Command& cmd) {
+int run_command(const Command& cmd, bool background, int* out_pid) {
     // if no program name exists then return error
     if (cmd.argv.empty()) {
         std::cerr << "myshell: empty command\n";
@@ -407,11 +554,7 @@ int run_command(const Command& cmd) {
         }
 
         // build argv for execvp from cmd.argv
-        std::vector<char*> argv;
-        for (const std::string& s : cmd.argv) {
-            argv.push_back(const_cast<char*>(s.c_str()));
-        }
-        argv.push_back(nullptr);
+        std::vector<char*> argv = build_exec_argv(cmd);
 
         // run program
         execvp(argv[0], argv.data());
@@ -423,24 +566,41 @@ int run_command(const Command& cmd) {
         _exit(127);
     }
 
-    // parent waits for child
+    // parent process
+    if (out_pid) {
+        *out_pid = static_cast<int>(pid);
+    }
+
+    // if background, do not wait
+    if (background) {
+        // add to job table
+        std::vector<int> pids;
+        pids.push_back(static_cast<int>(pid));
+
+        // command display string: join argv
+        std::string cmd_display;
+        for (size_t i = 0; i < cmd.argv.size(); i++) {
+            if (i) cmd_display += " ";
+            cmd_display += cmd.argv[i];
+        }
+
+        add_job(pids, cmd_display);
+        return 0;
+    }
+
+    // foreground waits for child
     return wait_for_child(pid);
 }
 
-// run the pipeline
-int run_pipeline(const CommandLine& cmdline) {
+// update 5: run pipeline, optionally background
+int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* out_pids) {
     // if pipeline is empty then return
     if (cmdline.pipeline.empty()) return 0;
 
     // number of commands in the pipeline
     size_t n = cmdline.pipeline.size();
 
-    // if there is only one command, just run it normally
-    if (n == 1) {
-        return run_command(cmdline.pipeline[0]);
-    }
-
-    // validate redirection rules :
+    // validate end-redirection rules (same as update 4):
     // - only first command can have stdin redirection
     // - only last command can have stdout redirection
     for (size_t i = 0; i < n; i++) {
@@ -455,7 +615,7 @@ int run_pipeline(const CommandLine& cmdline) {
     }
 
     // store all child pids so parent can wait for all of them
-    std::vector<pid_t> pids;
+    std::vector<int> pids;
 
     // previous pipe read end (for stdin of current command)
     int prev_read = -1;
@@ -543,20 +703,16 @@ int run_pipeline(const CommandLine& cmdline) {
                 close(fd);
             }
 
-            // build argv for execvp
+            // build argv and exec the command
             const Command& cmd = cmdline.pipeline[i];
             if (cmd.argv.empty()) {
                 std::cerr << "myshell: empty command\n";
                 _exit(1);
             }
 
-            std::vector<char*> argv;
-            for (const std::string& s : cmd.argv) {
-                argv.push_back(const_cast<char*>(s.c_str()));
-            }
-            argv.push_back(nullptr);
+            std::vector<char*> argv = build_exec_argv(cmd);
 
-            // exec the command
+            // exec the program
             execvp(argv[0], argv.data());
 
             // if exec returns, print error
@@ -565,7 +721,7 @@ int run_pipeline(const CommandLine& cmdline) {
         }
 
         // parent process
-        pids.push_back(pid);
+        pids.push_back(static_cast<int>(pid));
 
         // parent no longer needs prev_read (it was used for this stage)
         if (prev_read != -1) {
@@ -587,9 +743,33 @@ int run_pipeline(const CommandLine& cmdline) {
         prev_read = -1;
     }
 
-    // wait for all children, return status of last stage
-    int last_status = 0;
+    // if caller wants pids, return them
+    if (out_pids) {
+        *out_pids = pids;
+    }
 
+    // background: do not wait, add as one job
+    if (background) {
+        // build a display string for the pipeline command
+        std::string cmd_display;
+        for (size_t i = 0; i < cmdline.pipeline.size(); i++) {
+            if (i) {
+                cmd_display += " | ";
+            }
+            for (size_t k = 0; k < cmdline.pipeline[i].argv.size(); k++) {
+                if (k) {
+                    cmd_display += " ";
+                }
+                cmd_display += cmdline.pipeline[i].argv[k];
+            }
+        }
+
+        add_job(pids, cmd_display);
+        return 0;
+    }
+
+    // foreground: wait for all children, return status of last stage
+    int last_status = 0;
     for (size_t i = 0; i < pids.size(); i++) {
         int rc = wait_for_child(pids[i]);
 
