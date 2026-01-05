@@ -2,13 +2,10 @@
 
 A Unix-like shell implemented in C++, developed incrementally with a focus on
 systems programming fundamentals: process creation, program execution, and
-event-loop design. The project is built and tested on Linux using WSL and is
-structured to grow into a feature-complete “mini-bash” with pipelines, job
-control, and signal handling.
+Unix job control. The project is built and tested on Linux using WSL and is
+structured to grow into a feature-complete “mini-bash.”
 
 ## Current Status
-
-**Update 5 complete (background jobs + job table + reaping)**
 
 The shell currently supports:
 - An interactive read–eval–print loop
@@ -16,18 +13,20 @@ The shell currently supports:
 - Parsing into a structured command model (pipeline stages + redirection metadata + background flag)
 - Builtin commands (`cd`, `exit`, `jobs`)
 - Execution of external commands using `fork`, `execvp`, and `waitpid`
-- Input/output redirection using `open` + `dup2`:
-  - stdin redirection: `<`
-  - stdout redirection: `>`
-  - stdout append: `>>`
+- Input/output redirection using `open` + `dup2`
 - Pipelines of arbitrary length using `pipe` + `dup2`
-- Background execution with `&` for both single commands and pipelines
-- A simple job table tracking background jobs (job id, pids, command string, running/done)
-- Non-blocking child reaping using `waitpid(..., WNOHANG)` to prevent zombie processes
+- Background execution for both single commands and pipelines
+- A job table tracking background jobs (job id, pgid, pids, command string, state)
+- Foreground job execution using process groups and terminal control (`setpgid`, `tcsetpgrp`)
+- Non-blocking reaping of background children using `waitpid(..., WNOHANG)`
 - Clean build system using `make`
 
-> Note: This update implements basic background launching and tracking.
-> Full job control semantics (process groups, terminal control, signal routing, and `fg/bg`) are planned for later milestones.
+> Note: Background job completion is detected via polling at the start of each
+> shell loop iteration. Job completion messages may appear when the shell
+> regains control (e.g., after pressing Enter). Asynchronous signal-driven
+> reaping will be implemented in a later update.
+
+---
 
 ## Features (Implemented)
 
@@ -52,46 +51,43 @@ The shell currently supports:
   - opens files with `open()`
   - rewires file descriptors with `dup2()`
   - closes original descriptors after duplication
-- Reports file/permission errors cleanly and returns to the prompt
 
 ### Pipeline Execution
 - Executes pipelines with arbitrary length:
   - `cmd1 | cmd2`
   - `cmd1 | cmd2 | cmd3`
 - Creates `N-1` pipes for `N` stages and forks one process per stage
-- Connects stages using `dup2()`:
+- Connects pipeline stages using `dup2()`:
   - stage `i` stdout → pipe write end
   - stage `i+1` stdin → pipe read end
-- Closes unused pipe file descriptors in both parent and child processes to prevent hangs and ensure EOF propagates correctly
+- Closes unused pipe file descriptors in both parent and child processes to
+  ensure correct EOF behavior
 - Supports end redirection on pipelines under simplified rules:
   - `< file` only on the first stage
   - `> file` / `>> file` only on the last stage
 
-### Background Jobs + Job Table
+### Background Jobs
 - Supports background execution with `&`:
   - `sleep 5 &`
   - `cmd1 | cmd2 &`
-- Does not block the shell prompt for background jobs
+- Shell does not block on background jobs
 - Maintains a job table tracking:
-  - job id (`[1]`, `[2]`, ...)
-  - process ids (single pid for commands, multiple pids for pipelines)
-  - original command string (best-effort)
-  - job state (`Running` / `Done`)
-- Reaps completed background children using `waitpid(-1, ..., WNOHANG)` to prevent zombie processes
-- Prints a completion notification when a job finishes
-- Includes a `jobs` builtin to list current jobs
+  - job id
+  - process group id (pgid)
+  - process ids
+  - original command string
+  - running/done state
+- Includes a `jobs` builtin to list background jobs
 
-### Builtins
-- `cd [dir]`
-  - Changes the current working directory
-  - Defaults to `$HOME` when no directory is provided
-- `exit`
-  - Terminates the shell cleanly
-- `jobs`
-  - Lists tracked background jobs and their status
+### Process Groups + Terminal Control
+- Each command or pipeline runs in its own process group
+- Foreground jobs:
+  - receive terminal control via `tcsetpgrp()`
+  - run isolated from the shell
+  - return terminal control to the shell on completion
+- Background jobs:
+  - run in separate process groups
+  - do not receive terminal control
+- Shell runs in its own process group and ignores terminal job-control signals
+  (`SIGTTOU`, `SIGTTIN`, `SIGTSTP`) to prevent self-stopping
 
-### External Commands
-- Uses `fork()` to create a child process
-- Replaces the child process image with `execvp()`
-- Parent waits for completion using `waitpid()` for foreground jobs
-- Proper error reporting on failed execution

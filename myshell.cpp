@@ -10,19 +10,81 @@
 // needed for open() flags
 #include <fcntl.h>
 
+// needed for signals and terminal control
+#include <csignal>
+
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+// shell process group id
+static pid_t g_shell_pgid = -1;
 
-// ============================================================
-// update 5: job table
-// ============================================================
+// shell terminal fd (we use stdin as the controlling terminal)
+static int g_shell_terminal_fd = STDIN_FILENO;
+
+
+// initialize shell process group and attach to terminal
+void init_shell_job_control() {
+    // only attempt job control if stdin is a terminal
+    if (!isatty(g_shell_terminal_fd)) {
+        return;
+    }
+
+    // ignore interactive job control signals in the shell
+    // (full signal semantics will be implemented later)
+    std::signal(SIGTTOU, SIG_IGN);
+    std::signal(SIGTTIN, SIG_IGN);
+    std::signal(SIGTSTP, SIG_IGN);
+    std::signal(SIGINT,  SIG_IGN);
+    std::signal(SIGQUIT, SIG_IGN);
+
+    // put shell in its own process group
+    g_shell_pgid = getpid();
+
+    // setpgid(0, 0) makes this process its own process group leader
+    if (setpgid(0, 0) < 0) {
+        // if this fails, job control may not work, but shell can still run
+        std::cerr << "setpgid: " << std::strerror(errno) << "\n";
+    }
+
+    // ensure shell owns the terminal
+    if (tcsetpgrp(g_shell_terminal_fd, g_shell_pgid) < 0) {
+        // if this fails, pipelines can still work but terminal control may be limited
+        std::cerr << "tcsetpgrp: " << std::strerror(errno) << "\n";
+    }
+}
+
+// give terminal to a process group
+static void give_terminal_to(pid_t pgid) {
+    // only do this for interactive terminals
+    if (!isatty(g_shell_terminal_fd)) return;
+
+    // tcsetpgrp makes the given process group the foreground owner of the terminal
+    if (tcsetpgrp(g_shell_terminal_fd, pgid) < 0) {
+        std::cerr << "tcsetpgrp: " << std::strerror(errno) << "\n";
+    }
+}
+
+// reclaim terminal back to the shell
+static void reclaim_terminal() {
+    if (!isatty(g_shell_terminal_fd)) return;
+    if (g_shell_pgid < 0) return;
+
+    if (tcsetpgrp(g_shell_terminal_fd, g_shell_pgid) < 0) {
+        std::cerr << "tcsetpgrp: " << std::strerror(errno) << "\n";
+    }
+}
+
 
 // represents a background job
 class Job {
 public:
     // numeric job id: 1, 2, 3, ...
     int job_id = 0;
+
+    // process group id for the job
+    pid_t pgid = -1;
 
     // list of process ids belonging to this job (pipelines have multiple)
     std::vector<int> pids;
@@ -61,20 +123,11 @@ static std::vector<Job> g_jobs;
 // next job id counter
 static int g_next_job_id = 1;
 
-// helper to build a display string for tokens (approx original command)
-static std::string join_tokens_for_display(const std::vector<std::string>& tokens) {
-    std::string s;
-    for (size_t i = 0; i < tokens.size(); i++) {
-        if (i) s += " ";
-        s += tokens[i];
-    }
-    return s;
-}
-
 // add a job to the job table and print its launch info
-static void add_job(const std::vector<int>& pids, const std::string& cmd) {
+static void add_job(pid_t pgid, const std::vector<int>& pids, const std::string& cmd) {
     Job j;
     j.job_id = g_next_job_id++;
+    j.pgid = pgid;
     j.pids = pids;
     j.cmd = cmd;
     j.running = true;
@@ -82,9 +135,8 @@ static void add_job(const std::vector<int>& pids, const std::string& cmd) {
     g_jobs.push_back(j);
 
     // print job launch line similar to real shells
-    // choose the first pid as a representative id
-    int rep = (pids.empty() ? -1 : pids[0]);
-    std::cout << "[" << j.job_id << "] " << rep << "\n";
+    // choose the pgid as the representative id for the job
+    std::cout << "[" << j.job_id << "] " << j.pgid << "\n";
 }
 
 // print jobs builtin output
@@ -98,10 +150,6 @@ static void print_jobs() {
         }
     }
 }
-
-// ============================================================
-// basic shell utilities
-// ============================================================
 
 void print_prompt() {
     // print prompt and flush output so it appears immediately
@@ -326,7 +374,7 @@ bool is_builtin(const std::vector<std::string>& tokens) {
     // if tokens is empty then return false
     if (tokens.empty()) return false;
 
-    // update 5: add "jobs" builtin to display background jobs
+    // builtins are executed in the shell process
     return (tokens[0] == "cd" || tokens[0] == "exit" || tokens[0] == "jobs");
 }
 
@@ -428,7 +476,7 @@ int wait_for_child(int pid) {
     return 1;
 }
 
-// update 5: reap finished background jobs using WNOHANG
+// reap finished background jobs using WNOHANG
 void reap_background_jobs() {
     int status = 0;
 
@@ -465,9 +513,6 @@ void reap_background_jobs() {
             }
         }
     }
-
-    // optional cleanup: remove jobs that are done to keep list small
-    // keep it simple: leave them so "jobs" shows Done entries too
 }
 
 // helper: build argv for execvp from Command.argv
@@ -480,8 +525,7 @@ static std::vector<char*> build_exec_argv(const Command& cmd) {
     return argv;
 }
 
-// run a single command with redirection
-int run_command(const Command& cmd, bool background, int* out_pid) {
+int run_command(const Command& cmd, bool background, int* out_pid, int* out_pgid) {
     // if no program name exists then return error
     if (cmd.argv.empty()) {
         std::cerr << "myshell: empty command\n";
@@ -497,110 +541,116 @@ int run_command(const Command& cmd, bool background, int* out_pid) {
         return 1;
     }
 
-    // if we are in the child process
+    // child process
     if (pid == 0) {
+        // put child into its own process group (pgid = child pid)
+        // setpgid(0,0) makes this child a process group leader
+        if (setpgid(0, 0) < 0) {
+            // if this fails, job control may be limited, but try to continue
+            std::cerr << "setpgid: " << std::strerror(errno) << "\n";
+        }
+
         // apply <
         if (cmd.has_stdin()) {
-            // open input file as read-only
             int fd = open(cmd.stdin_file.c_str(), O_RDONLY);
-
-            // if open fails, print error and exit child
             if (fd < 0) {
                 std::cerr << cmd.stdin_file << ": " << std::strerror(errno) << "\n";
                 _exit(1);
             }
-
-            // duplicate fd onto stdin (fd 0)
             if (dup2(fd, STDIN_FILENO) < 0) {
                 std::cerr << "dup2: " << std::strerror(errno) << "\n";
                 close(fd);
                 _exit(1);
             }
-
-            // close original fd after dup2
             close(fd);
         }
 
         // apply > or >>
         if (cmd.has_stdout()) {
-            // choose flags based on append vs truncate
             int flags = O_WRONLY | O_CREAT;
-
-            // >> means append, > means truncate
             if (cmd.append) {
                 flags |= O_APPEND;
             } else {
                 flags |= O_TRUNC;
             }
 
-            // open output file with mode 0644 (rw-r--r--)
             int fd = open(cmd.stdout_file.c_str(), flags, 0644);
-
-            // if open fails, print error and exit child
             if (fd < 0) {
                 std::cerr << cmd.stdout_file << ": " << std::strerror(errno) << "\n";
                 _exit(1);
             }
-
-            // duplicate fd onto stdout (fd 1)
             if (dup2(fd, STDOUT_FILENO) < 0) {
                 std::cerr << "dup2: " << std::strerror(errno) << "\n";
                 close(fd);
                 _exit(1);
             }
-
-            // close original fd after dup2
             close(fd);
         }
 
-        // build argv for execvp from cmd.argv
+        // build argv and exec
         std::vector<char*> argv = build_exec_argv(cmd);
-
-        // run program
         execvp(argv[0], argv.data());
 
-        // if execvp returns, an error occurred
+        // exec failed
         std::cerr << cmd.argv[0] << ": " << std::strerror(errno) << "\n";
-
-        // exit child immediately
         _exit(127);
     }
 
     // parent process
-    if (out_pid) {
-        *out_pid = static_cast<int>(pid);
+    // update 6: put child into its own process group (race-safe: do it in parent too)
+    if (setpgid(pid, pid) < 0) {
+        // if this fails, job control may be limited, but continue
+        // EACCES can happen if child execs very fast; this is often benign
     }
 
-    // if background, do not wait
+    // update 6: pgid for this job is pid
+    pid_t pgid = pid;
+
+    if (out_pid) *out_pid = static_cast<int>(pid);
+    if (out_pgid) *out_pgid = static_cast<int>(pgid);
+
+    // background: do not wait, add job and return
     if (background) {
-        // add to job table
         std::vector<int> pids;
         pids.push_back(static_cast<int>(pid));
 
-        // command display string: join argv
+        // build display string
         std::string cmd_display;
         for (size_t i = 0; i < cmd.argv.size(); i++) {
             if (i) cmd_display += " ";
             cmd_display += cmd.argv[i];
         }
 
-        add_job(pids, cmd_display);
+        add_job(pgid, pids, cmd_display);
         return 0;
     }
 
-    // foreground waits for child
-    return wait_for_child(pid);
+    // foreground: give terminal to job, wait, then reclaim terminal
+    give_terminal_to(pgid);
+
+    int rc = wait_for_child(pid);
+
+    reclaim_terminal();
+    return rc;
 }
 
-// update 5: run pipeline, optionally background
-int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* out_pids) {
+int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* out_pids, int* out_pgid) {
     // if pipeline is empty then return
     if (cmdline.pipeline.empty()) return 0;
 
-    // number of commands in the pipeline
     size_t n = cmdline.pipeline.size();
 
-    // validate end-redirection rules (same as update 4):
+    // single command pipeline just runs command logic
+    if (n == 1) {
+        int pid = -1;
+        int pgid = -1;
+        int rc = run_command(cmdline.pipeline[0], background, &pid, &pgid);
+        if (out_pids) out_pids->assign(1, pid);
+        if (out_pgid) *out_pgid = pgid;
+        return rc;
+    }
+
+    // validate end-redirection rules:
     // - only first command can have stdin redirection
     // - only last command can have stdout redirection
     for (size_t i = 0; i < n; i++) {
@@ -614,18 +664,20 @@ int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* 
         }
     }
 
-    // store all child pids so parent can wait for all of them
+    // store child pids for waiting / job table
     std::vector<int> pids;
 
-    // previous pipe read end (for stdin of current command)
+    // process group id for the entire pipeline (set after first fork)
+    pid_t pgid = -1;
+
+    // previous pipe read end
     int prev_read = -1;
 
-    // create each stage of the pipeline
+    // create each stage
     for (size_t i = 0; i < n; i++) {
-
-        // create a new pipe for this stage to the next stage
-        // last stage does not need a pipe
         int pipefd[2] = {-1, -1};
+
+        // last stage does not need a pipe
         if (i < n - 1) {
             if (pipe(pipefd) < 0) {
                 std::cerr << "pipe: " << std::strerror(errno) << "\n";
@@ -633,10 +685,8 @@ int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* 
             }
         }
 
-        // fork a child for this stage
         pid_t pid = fork();
 
-        // fork failed
         if (pid < 0) {
             std::cerr << "fork: " << std::strerror(errno) << "\n";
             return 1;
@@ -644,8 +694,21 @@ int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* 
 
         // child process
         if (pid == 0) {
+            // set process group for this stage
+            // first stage becomes the group leader
+            if (i == 0) {
+                // make this child its own process group leader
+                if (setpgid(0, 0) < 0) {
+                    std::cerr << "setpgid: " << std::strerror(errno) << "\n";
+                }
+            } else {
+                // join existing process group
+                if (setpgid(0, pgid) < 0) {
+                    std::cerr << "setpgid: " << std::strerror(errno) << "\n";
+                }
+            }
 
-            // if this is not the first stage, connect stdin to prev_read
+            // connect stdin from previous pipe
             if (i > 0) {
                 if (dup2(prev_read, STDIN_FILENO) < 0) {
                     std::cerr << "dup2: " << std::strerror(errno) << "\n";
@@ -653,7 +716,7 @@ int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* 
                 }
             }
 
-            // if this is not the last stage, connect stdout to pipe write end
+            // connect stdout to next pipe
             if (i < n - 1) {
                 if (dup2(pipefd[1], STDOUT_FILENO) < 0) {
                     std::cerr << "dup2: " << std::strerror(errno) << "\n";
@@ -661,7 +724,7 @@ int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* 
                 }
             }
 
-            // close fds that are no longer needed after dup2
+            // close unused fds
             if (prev_read != -1) close(prev_read);
             if (pipefd[0] != -1) close(pipefd[0]);
             if (pipefd[1] != -1) close(pipefd[1]);
@@ -703,7 +766,7 @@ int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* 
                 close(fd);
             }
 
-            // build argv and exec the command
+            // exec command
             const Command& cmd = cmdline.pipeline[i];
             if (cmd.argv.empty()) {
                 std::cerr << "myshell: empty command\n";
@@ -711,108 +774,102 @@ int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* 
             }
 
             std::vector<char*> argv = build_exec_argv(cmd);
-
-            // exec the program
             execvp(argv[0], argv.data());
 
-            // if exec returns, print error
             std::cerr << cmd.argv[0] << ": " << std::strerror(errno) << "\n";
             _exit(127);
         }
 
         // parent process
+        // after first fork, establish pgid as first child's pid
+        if (i == 0) {
+            pgid = pid;
+        }
+
+        // set process group from parent side too (race-safe)
+        if (setpgid(pid, pgid) < 0) {
+            // benign failures can happen if child execs fast
+        }
+
         pids.push_back(static_cast<int>(pid));
 
-        // parent no longer needs prev_read (it was used for this stage)
+        // parent closes previous read end
         if (prev_read != -1) {
             close(prev_read);
             prev_read = -1;
         }
 
-        // parent keeps read end of current pipe for next stage
-        // parent closes write end immediately
+        // parent keeps read end for next stage
         if (i < n - 1) {
             close(pipefd[1]);
             prev_read = pipefd[0];
         }
     }
 
-    // parent: after spawning all children, close any remaining pipe read end
+    // close any leftover pipe read end
     if (prev_read != -1) {
         close(prev_read);
         prev_read = -1;
     }
 
-    // if caller wants pids, return them
     if (out_pids) {
         *out_pids = pids;
     }
+    if (out_pgid) {
+        *out_pgid = static_cast<int>(pgid);
+    }
 
-    // background: do not wait, add as one job
+    // background: do not wait, add job and return
     if (background) {
-        // build a display string for the pipeline command
+        // build a display string for pipeline
         std::string cmd_display;
         for (size_t i = 0; i < cmdline.pipeline.size(); i++) {
-            if (i) {
-                cmd_display += " | ";
-            }
+            if (i) cmd_display += " | ";
             for (size_t k = 0; k < cmdline.pipeline[i].argv.size(); k++) {
-                if (k) {
-                    cmd_display += " ";
-                }
+                if (k) cmd_display += " ";
                 cmd_display += cmdline.pipeline[i].argv[k];
             }
         }
 
-        add_job(pids, cmd_display);
+        add_job(pgid, pids, cmd_display);
         return 0;
     }
 
-    // foreground: wait for all children, return status of last stage
+    // foreground: give terminal to job process group, wait for all, reclaim terminal
+    give_terminal_to(pgid);
+
     int last_status = 0;
     for (size_t i = 0; i < pids.size(); i++) {
         int rc = wait_for_child(pids[i]);
-
-        // store status of the last command in the pipeline
         if (i == pids.size() - 1) {
             last_status = rc;
         }
     }
 
+    reclaim_terminal();
     return last_status;
 }
+
 
 // not used anymore, legacy for simple commands
 int run_external(const std::vector<std::string>& tokens) {
     // if empty return
     if (tokens.empty()) return 0;
 
-    // fork to create a child process
     pid_t pid = fork();
 
-    // if fork fails
     if (pid < 0) {
         std::cerr << "fork: " << std::strerror(errno) << "\n";
         return 1;
     }
 
-    // if we are in the child process
     if (pid == 0) {
-
         std::vector<char*> argv = build_argv(tokens);
-
-        // use execvp to launch command
         execvp(argv[0], argv.data());
 
-        // if execvp returns, an error occurred
-        std::cerr << tokens[0] << ": "
-                  << std::strerror(errno) << "\n";
-
-        // exit child immediately
-        // 127 means command not found
+        std::cerr << tokens[0] << ": " << std::strerror(errno) << "\n";
         _exit(127);
     }
 
-    // have the parent process wait for the child
     return wait_for_child(pid);
 }

@@ -5,6 +5,9 @@
 #include <iostream>
 
 int main() {
+    // initialize shell process group and terminal control
+    init_shell_job_control();
+
     // infinite loop
     while (true) {
 
@@ -52,35 +55,35 @@ int main() {
             continue;
         }
 
-        // if pipeline then run pipeline (foreground or background)
+        // pipeline execution path
         if (cmdline.is_pipeline()) {
-
-            // background pipeline: do not wait, record job
             if (cmdline.background) {
+                // background pipeline: do not wait
                 std::vector<int> pids;
-                run_pipeline(cmdline, true, &pids);
+                int pgid = -1;
+                run_pipeline(cmdline, true, &pids, &pgid);
             } else {
-                // foreground pipeline: wait like normal
-                run_pipeline(cmdline, false, nullptr);
+                // foreground pipeline: shell gives terminal to job then waits
+                run_pipeline(cmdline, false, nullptr, nullptr);
             }
-
             continue;
         }
 
-        // run single command
+        // single command execution path
         if (cmdline.pipeline.empty()) {
             // should not happen if parser is correct, but keep a failsafe
             std::cerr << "myshell: internal error: no command to run\n";
             continue;
         }
 
-        // background single command: do not wait, record job
         if (cmdline.background) {
+            // background single command: do not wait
             int pid = -1;
-            run_command(cmdline.pipeline[0], true, &pid);
+            int pgid = -1;
+            run_command(cmdline.pipeline[0], true, &pid, &pgid);
         } else {
             // foreground single command
-            run_command(cmdline.pipeline[0], false, nullptr);
+            run_command(cmdline.pipeline[0], false, nullptr, nullptr);
         }
     }
 

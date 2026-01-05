@@ -18,6 +18,9 @@ std::vector<std::string> tokenize_whitespace(const std::string& line);
 // splits input line into tokens while preserving operators
 std::vector<std::string> tokenize_operators(const std::string& line);
 
+// initialize shell process group and terminal control
+void init_shell_job_control();
+
 // describes one command in a pipeline
 class Command {
 public:
@@ -68,12 +71,14 @@ bool is_builtin(const std::vector<std::string>& tokens);
 int run_builtin(const std::vector<std::string>& tokens);
 
 // executes a single parsed command
-// if background == true, shell does not wait and child pid is returned via out_pid
-int run_command(const Command& cmd, bool background, int* out_pid);
+// if background == true, shell does not wait
+// child pid and pgid are returned via out_pid/out_pgid if non-null
+int run_command(const Command& cmd, bool background, int* out_pid, int* out_pgid);
 
 // executes a parsed pipeline
-// if background == true, shell does not wait and all stage pids are returned via out_pids
-int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* out_pids);
+// if background == true, shell does not wait
+// stage pids and pgid are returned via out_pids/out_pgid if non-null
+int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* out_pids, int* out_pgid);
 
 // legacy -- does not support redirection
 int run_external(const std::vector<std::string>& tokens);
