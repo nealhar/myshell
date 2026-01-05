@@ -9,7 +9,8 @@
 // prints shell prompt
 void print_prompt();
 
-// reads line from stdin, true means line was successfully read, false if end of file
+// reads line from stdin, returns true if line was read, returns false if EOF occurred
+// returns true with line="" if interrupted by signal (EINTR) so loop can reap + re-prompt
 bool read_line(std::string& line);
 
 // splits input line by whitespace into tokens -- not used anymore
@@ -20,6 +21,9 @@ std::vector<std::string> tokenize_operators(const std::string& line);
 
 // initialize shell process group and terminal control
 void init_shell_job_control();
+
+// initialize signal handlers (SIGCHLD, SIGINT, SIGTSTP)
+void init_shell_signals();
 
 // describes one command in a pipeline
 class Command {
@@ -72,22 +76,17 @@ int run_builtin(const std::vector<std::string>& tokens);
 
 // executes a single parsed command
 // if background == true, shell does not wait
-// child pid and pgid are returned via out_pid/out_pgid if non-null
-int run_command(const Command& cmd, bool background, int* out_pid, int* out_pgid);
+int run_command(const Command& cmd, bool background);
 
 // executes a parsed pipeline
 // if background == true, shell does not wait
-// stage pids and pgid are returned via out_pids/out_pgid if non-null
-int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* out_pids, int* out_pgid);
+int run_pipeline(const CommandLine& cmdline, bool background);
 
 // legacy -- does not support redirection
 int run_external(const std::vector<std::string>& tokens);
 
-// waits for child (blocking)
-int wait_for_child(int pid);
+// reap any finished/stopped/continued children
+void reap_children();
 
 // builds argv array for execvp, must be null terminated
 std::vector<char*> build_argv(const std::vector<std::string>& tokens);
-
-// reap any finished background children (WNOHANG)
-void reap_background_jobs();

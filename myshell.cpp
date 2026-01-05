@@ -10,8 +10,11 @@
 // needed for open() flags
 #include <fcntl.h>
 
-// needed for signals and terminal control
+// signal + terminal control helpers
 #include <csignal>
+#include <signal.h>
+#include <sys/select.h>
+
 
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -23,39 +26,13 @@ static pid_t g_shell_pgid = -1;
 // shell terminal fd (we use stdin as the controlling terminal)
 static int g_shell_terminal_fd = STDIN_FILENO;
 
+// set by SIGCHLD handler to tell main loop there is work to reap
+static volatile sig_atomic_t g_sigchld_flag = 0;
 
-// initialize shell process group and attach to terminal
-void init_shell_job_control() {
-    // only attempt job control if stdin is a terminal
-    if (!isatty(g_shell_terminal_fd)) {
-        return;
-    }
+// current foreground process group id (0 or -1 means no foreground job)
+static volatile sig_atomic_t g_fg_pgid = 0;
 
-    // ignore interactive job control signals in the shell
-    // (full signal semantics will be implemented later)
-    std::signal(SIGTTOU, SIG_IGN);
-    std::signal(SIGTTIN, SIG_IGN);
-    std::signal(SIGTSTP, SIG_IGN);
-    std::signal(SIGINT,  SIG_IGN);
-    std::signal(SIGQUIT, SIG_IGN);
 
-    // put shell in its own process group
-    g_shell_pgid = getpid();
-
-    // setpgid(0, 0) makes this process its own process group leader
-    if (setpgid(0, 0) < 0) {
-        // if this fails, job control may not work, but shell can still run
-        std::cerr << "setpgid: " << std::strerror(errno) << "\n";
-    }
-
-    // ensure shell owns the terminal
-    if (tcsetpgrp(g_shell_terminal_fd, g_shell_pgid) < 0) {
-        // if this fails, pipelines can still work but terminal control may be limited
-        std::cerr << "tcsetpgrp: " << std::strerror(errno) << "\n";
-    }
-}
-
-// give terminal to a process group
 static void give_terminal_to(pid_t pgid) {
     // only do this for interactive terminals
     if (!isatty(g_shell_terminal_fd)) return;
@@ -66,7 +43,6 @@ static void give_terminal_to(pid_t pgid) {
     }
 }
 
-// reclaim terminal back to the shell
 static void reclaim_terminal() {
     if (!isatty(g_shell_terminal_fd)) return;
     if (g_shell_pgid < 0) return;
@@ -77,7 +53,39 @@ static void reclaim_terminal() {
 }
 
 
-// represents a background job
+// initialize shell process group and attach to terminal
+void init_shell_job_control() {
+    // only attempt job control if stdin is a terminal
+    if (!isatty(g_shell_terminal_fd)) {
+        return;
+    }
+
+    // put shell in its own process group
+    g_shell_pgid = getpid();
+
+    // setpgid(0,0) makes this process its own process group leader
+    if (setpgid(0, 0) < 0) {
+        std::cerr << "setpgid: " << std::strerror(errno) << "\n";
+    }
+
+    // ensure shell owns the terminal
+    if (tcsetpgrp(g_shell_terminal_fd, g_shell_pgid) < 0) {
+        std::cerr << "tcsetpgrp: " << std::strerror(errno) << "\n";
+    }
+
+    // ignore SIGTTOU so tcsetpgrp does not stop the shell
+    std::signal(SIGTTOU, SIG_IGN);
+    std::signal(SIGTTIN, SIG_IGN);
+}
+
+
+enum class JobState {
+    RUNNING,
+    STOPPED,
+    DONE
+};
+
+// represents a job (background, or stopped foreground that becomes manageable)
 class Job {
 public:
     // numeric job id: 1, 2, 3, ...
@@ -92,8 +100,8 @@ public:
     // the command line text (for display)
     std::string cmd;
 
-    // true if job still running, false if fully finished
-    bool running = true;
+    // job state
+    JobState state = JobState::RUNNING;
 
     // helper: check if a pid is part of this job
     bool contains_pid(int pid) const {
@@ -112,44 +120,128 @@ public:
             }
         }
         if (pids.empty()) {
-            running = false;
+            state = JobState::DONE;
         }
     }
 };
 
-// global job table for this simple shell milestone
+// global job table
 static std::vector<Job> g_jobs;
 
 // next job id counter
 static int g_next_job_id = 1;
 
-// add a job to the job table and print its launch info
-static void add_job(pid_t pgid, const std::vector<int>& pids, const std::string& cmd) {
+// add job to the job table
+static int add_job(pid_t pgid, const std::vector<int>& pids, const std::string& cmd, JobState st) {
     Job j;
     j.job_id = g_next_job_id++;
     j.pgid = pgid;
     j.pids = pids;
     j.cmd = cmd;
-    j.running = true;
+    j.state = st;
 
     g_jobs.push_back(j);
+    return j.job_id;
+}
 
-    // print job launch line similar to real shells
-    // choose the pgid as the representative id for the job
-    std::cout << "[" << j.job_id << "] " << j.pgid << "\n";
+// print a job launch line
+static void print_job_started(int job_id, pid_t pgid) {
+    std::cout << "[" << job_id << "] " << pgid << "\n";
 }
 
 // print jobs builtin output
 static void print_jobs() {
-    // print each job state
     for (const Job& j : g_jobs) {
-        if (j.running) {
+        if (j.state == JobState::RUNNING) {
             std::cout << "[" << j.job_id << "] Running  " << j.cmd << "\n";
+        } else if (j.state == JobState::STOPPED) {
+            std::cout << "[" << j.job_id << "] Stopped  " << j.cmd << "\n";
         } else {
             std::cout << "[" << j.job_id << "] Done     " << j.cmd << "\n";
         }
     }
 }
+
+
+// SIGCHLD handler: just set a flag
+static void sigchld_handler(int) {
+    g_sigchld_flag = 1;
+}
+
+// SIGINT/SIGTSTP handler: forward to foreground process group if one exists
+static void forward_to_foreground(int sig) {
+    pid_t pgid = (pid_t)g_fg_pgid;
+
+    // if no foreground job, do nothing
+    if (pgid <= 0) {
+        return;
+    }
+
+    // send signal to the entire foreground process group
+    // negative pid means "process group"
+    kill(-pgid, sig);
+}
+
+static void sigint_handler(int sig) {
+    forward_to_foreground(sig);
+}
+
+static void sigtstp_handler(int sig) {
+    forward_to_foreground(sig);
+}
+
+// install signal handlers using sigaction so we can control SA_RESTART behavior
+void init_shell_signals() {
+    // SIGCHLD: notify main loop to reap children
+    {
+        struct sigaction sa;
+        std::memset(&sa, 0, sizeof(sa));
+
+        sa.sa_handler = sigchld_handler;
+
+        // do NOT set SA_RESTART:
+        // we want blocking input to return with EINTR so we can reap and print "Done"
+        sa.sa_flags = 0;
+
+        sigemptyset(&sa.sa_mask);
+
+        if (sigaction(SIGCHLD, &sa, nullptr) < 0) {
+            std::cerr << "sigaction(SIGCHLD): " << std::strerror(errno) << "\n";
+        }
+    }
+
+    // SIGINT: forward Ctrl-C to foreground job (shell stays alive)
+    {
+        struct sigaction sa;
+        std::memset(&sa, 0, sizeof(sa));
+
+        sa.sa_handler = sigint_handler;
+        sa.sa_flags = 0;
+        sigemptyset(&sa.sa_mask);
+
+        if (sigaction(SIGINT, &sa, nullptr) < 0) {
+            std::cerr << "sigaction(SIGINT): " << std::strerror(errno) << "\n";
+        }
+    }
+
+    // SIGTSTP: forward Ctrl-Z to foreground job
+    {
+        struct sigaction sa;
+        std::memset(&sa, 0, sizeof(sa));
+
+        sa.sa_handler = sigtstp_handler;
+        sa.sa_flags = 0;
+        sigemptyset(&sa.sa_mask);
+
+        if (sigaction(SIGTSTP, &sa, nullptr) < 0) {
+            std::cerr << "sigaction(SIGTSTP): " << std::strerror(errno) << "\n";
+        }
+    }
+
+    // ignore SIGQUIT like most shells
+    std::signal(SIGQUIT, SIG_IGN);
+}
+
 
 void print_prompt() {
     // print prompt and flush output so it appears immediately
@@ -157,17 +249,55 @@ void print_prompt() {
 }
 
 bool read_line(std::string& line) {
-    // get line
-    return static_cast<bool>(std::getline(std::cin, line));
+    // clear output line
+    line.clear();
+
+    // read input one byte at a time until newline or EOF
+    while (true) {
+        char c = 0;
+
+        // read 1 byte from stdin
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+
+        // EOF: user pressed Ctrl-D on an empty line
+        if (n == 0) {
+            // if we already collected characters, treat it as a final line
+            // (bash typically executes the line; this behavior is acceptable)
+            if (!line.empty()) {
+                return true;
+            }
+            return false;
+        }
+
+        // read error
+        if (n < 0) {
+            // interrupted by signal: return to main loop so it can reap children
+            if (errno == EINTR) {
+                // leave line as-is (usually empty), caller can reap + re-prompt
+                return true;
+            }
+
+            // other errors
+            std::cerr << "read: " << std::strerror(errno) << "\n";
+            return true;
+        }
+
+        // newline ends the line
+        if (c == '\n') {
+            return true;
+        }
+
+        // normal character: append
+        line.push_back(c);
+    }
 }
 
+
 std::vector<std::string> tokenize_whitespace(const std::string& line) {
-    // use string stream to split by whitespace
     std::istringstream iss(line);
     std::vector<std::string> tokens;
 
     std::string token;
-    // will return false when no token, so this reads all tokens and adds to vector
     while (iss >> token) {
         tokens.push_back(token);
     }
@@ -215,7 +345,6 @@ std::vector<std::string> tokenize_operators(const std::string& line) {
                 tokens.push_back(">>");
                 i++;
             } else {
-                // single char operator
                 tokens.push_back(std::string(1, c));
             }
             continue;
@@ -232,7 +361,6 @@ std::vector<std::string> tokenize_operators(const std::string& line) {
 }
 
 bool contains_operators(const std::vector<std::string>& tokens) {
-    // if any operator tokens exist, return true
     for (const std::string& t : tokens) {
         if (t == "|" || t == "<" || t == ">" || t == ">>" || t == "&") {
             return true;
@@ -242,17 +370,14 @@ bool contains_operators(const std::vector<std::string>& tokens) {
 }
 
 bool Command::has_stdin() const {
-    // true if input redirection file was provided
     return !stdin_file.empty();
 }
 
 bool Command::has_stdout() const {
-    // true if output redirection file was provided
     return !stdout_file.empty();
 }
 
 bool CommandLine::is_pipeline() const {
-    // true if more than one command exists
     return pipeline.size() > 1;
 }
 
@@ -268,41 +393,33 @@ static bool is_operator_token(const std::string& t) {
 
 // parse the command line
 bool parse_command_line(const std::vector<std::string>& tokens, CommandLine& out, std::string& err_msg) {
-    // reset output
     out = CommandLine{};
     err_msg.clear();
 
-    // if command is empty then return false
     if (tokens.empty()) {
         err_msg = "empty command";
         return false;
     }
 
-    // if operator is misplaced then return false
     if (tokens[0] == "|") {
         err_msg = "syntax error near unexpected token '|'";
         return false;
     }
 
-    // if last token is & then mark it as background and remove it for parsing
     size_t end = tokens.size();
     if (tokens[end - 1] == "&") {
         out.background = true;
         end--;
 
-        // "&" by itself is invalid
         if (end == 0) {
             err_msg = "syntax error near unexpected token '&'";
             return false;
         }
     }
 
-    // current command being built
     Command current;
 
-    // helper to finalize current command into pipeline
     auto flush_command = [&]() -> bool {
-        // command must have argv[0]
         if (current.argv.empty()) {
             err_msg = "syntax error: missing command";
             return false;
@@ -312,16 +429,12 @@ bool parse_command_line(const std::vector<std::string>& tokens, CommandLine& out
         return true;
     };
 
-    // parse each token
     for (size_t i = 0; i < end; i++) {
         const std::string& t = tokens[i];
 
-        // handle pipeline separator
         if (t == "|") {
-            // cannot pipe without a command before it
             if (!flush_command()) return false;
 
-            // next token cannot be end or another pipe
             if (i + 1 >= end || tokens[i + 1] == "|") {
                 err_msg = "syntax error near unexpected token '|'";
                 return false;
@@ -329,22 +442,19 @@ bool parse_command_line(const std::vector<std::string>& tokens, CommandLine& out
             continue;
         }
 
-        // handle redirections
         if (is_redirect_token(t)) {
-            // must have a filename following
             if (i + 1 >= end) {
                 err_msg = "syntax error: redirection missing filename";
                 return false;
             }
-            // filename is next token
+
             const std::string& file = tokens[i + 1];
 
-            // filename cannot be another operator
             if (is_operator_token(file)) {
                 err_msg = "syntax error: redirection missing filename";
                 return false;
             }
-            // handle what the file is based on preceding operator
+
             if (t == "<") {
                 current.stdin_file = file;
             } else if (t == ">") {
@@ -354,39 +464,31 @@ bool parse_command_line(const std::vector<std::string>& tokens, CommandLine& out
                 current.stdout_file = file;
                 current.append = true;
             }
-            // skip filename token
+
             i++;
             continue;
         }
 
-        // normal argument token
         current.argv.push_back(t);
     }
 
-    // push last command
     if (!flush_command()) return false;
 
     return true;
 }
 
-// see if command is built in
-bool is_builtin(const std::vector<std::string>& tokens) {
-    // if tokens is empty then return false
-    if (tokens.empty()) return false;
 
-    // builtins are executed in the shell process
+bool is_builtin(const std::vector<std::string>& tokens) {
+    if (tokens.empty()) return false;
     return (tokens[0] == "cd" || tokens[0] == "exit" || tokens[0] == "jobs");
 }
 
-// helper function for cd
 static int builtin_cd(const std::vector<std::string>& tokens) {
     const char* target = nullptr;
 
-    // if directory is provided: cd <dir>
     if (tokens.size() >= 2) {
         target = tokens[1].c_str();
     } else {
-        // default cd is home
         target = std::getenv("HOME");
         if (!target) {
             std::cerr << "cd: HOME not set\n";
@@ -394,7 +496,6 @@ static int builtin_cd(const std::vector<std::string>& tokens) {
         }
     }
 
-    // attempt directory change with chdir syscall
     if (chdir(target) != 0) {
         std::cerr << "cd: " << std::strerror(errno) << "\n";
         return 1;
@@ -403,116 +504,24 @@ static int builtin_cd(const std::vector<std::string>& tokens) {
     return 0;
 }
 
-// run the built in command
 int run_builtin(const std::vector<std::string>& tokens) {
-    // if empty then return
     if (tokens.empty()) return 0;
 
-    // if exit then signal main to terminate loop
     if (tokens[0] == "exit") {
         return -1;
     }
 
-    // cd builtin
     if (tokens[0] == "cd") {
         return builtin_cd(tokens);
     }
 
-    // jobs builtin
     if (tokens[0] == "jobs") {
         print_jobs();
         return 0;
     }
 
-    // failsafe incase is_builtin is incorrect
     std::cerr << "Unknown builtin\n";
     return 1;
-}
-
-// generate argv for execvp
-std::vector<char*> build_argv(const std::vector<std::string>& tokens) {
-    // argv needs to be char array with null termination
-    std::vector<char*> argv;
-
-    // for strings in tokens add character arrays (strings) to argv
-    for (const std::string& s : tokens) {
-        argv.push_back(const_cast<char*>(s.c_str()));
-    }
-
-    // null-terminate argv
-    argv.push_back(nullptr);
-    return argv;
-}
-
-// waiting for child (blocking)
-int wait_for_child(int pid) {
-    int status = 0;
-
-    // use waitpid syscall to wait for child
-    while (true) {
-        pid_t w = waitpid(pid, &status, 0);
-
-        if (w == -1) {
-            if (errno == EINTR) {
-                // retry
-                continue;
-            }
-            std::cerr << "waitpid: " << std::strerror(errno) << "\n";
-            return 1;
-        }
-        break;
-    }
-
-    // normal exit
-    if (WIFEXITED(status)) {
-        return WEXITSTATUS(status);
-    }
-
-    // signaled exit
-    if (WIFSIGNALED(status)) {
-        return 128 + WTERMSIG(status);
-    }
-
-    return 1;
-}
-
-// reap finished background jobs using WNOHANG
-void reap_background_jobs() {
-    int status = 0;
-
-    // loop reaping until no more children have exited
-    while (true) {
-        pid_t pid = waitpid(-1, &status, WNOHANG);
-
-        // no more finished children
-        if (pid == 0) {
-            break;
-        }
-
-        // error: no children or other issue
-        if (pid < 0) {
-            // if no child processes exist, this is normal in many shells
-            if (errno == ECHILD) {
-                break;
-            }
-            // other errors should be reported
-            std::cerr << "waitpid: " << std::strerror(errno) << "\n";
-            break;
-        }
-
-        // find which job this pid belongs to and mark it finished
-        for (Job& j : g_jobs) {
-            if (j.running && j.contains_pid(static_cast<int>(pid))) {
-                j.remove_pid(static_cast<int>(pid));
-
-                // if this was the last pid in the job, job is done
-                if (!j.running) {
-                    std::cout << "[" << j.job_id << "] Done     " << j.cmd << "\n";
-                }
-                break;
-            }
-        }
-    }
 }
 
 // helper: build argv for execvp from Command.argv
@@ -525,30 +534,141 @@ static std::vector<char*> build_exec_argv(const Command& cmd) {
     return argv;
 }
 
-int run_command(const Command& cmd, bool background, int* out_pid, int* out_pgid) {
-    // if no program name exists then return error
+// reap finished/stopped/continued children
+void reap_children() {
+    // only do real work if a SIGCHLD happened (fast path)
+    if (!g_sigchld_flag) {
+        return;
+    }
+
+    // clear flag and reap everything available
+    g_sigchld_flag = 0;
+
+    int status = 0;
+
+    while (true) {
+        // reap any child that changed state
+        pid_t pid = waitpid(-1, &status, WNOHANG | WUNTRACED | WCONTINUED);
+
+        if (pid == 0) {
+            // no more state changes available right now
+            break;
+        }
+
+        if (pid < 0) {
+            if (errno == ECHILD) {
+                break;
+            }
+            std::cerr << "waitpid: " << std::strerror(errno) << "\n";
+            break;
+        }
+
+        // update job table based on this pid
+        for (Job& j : g_jobs) {
+            if (!j.contains_pid((int)pid)) continue;
+
+            // process exited normally or via signal -> remove from job pids
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                j.remove_pid((int)pid);
+
+                // if job is done, print done message
+                if (j.state == JobState::DONE) {
+                    std::cout << "[" << j.job_id << "] Done     " << j.cmd << "\n";
+                }
+            }
+
+            // process stopped -> mark job stopped
+            if (WIFSTOPPED(status)) {
+                j.state = JobState::STOPPED;
+                std::cout << "[" << j.job_id << "] Stopped  " << j.cmd << "\n";
+            }
+
+            // process continued -> mark job running
+            if (WIFCONTINUED(status)) {
+                j.state = JobState::RUNNING;
+            }
+
+            break;
+        }
+    }
+}
+
+// wait for a foreground process group until it either finishes or stops
+// returns:
+// - 0 if job finished normally (at least one child exited)
+// - 2 if job stopped (Ctrl-Z)
+// - 1 on error
+static int wait_for_foreground_job(pid_t pgid, std::vector<int>& pids, bool& stopped_out) {
+    stopped_out = false;
+
+    // wait until all pids are gone, or we detect a stop
+    while (!pids.empty()) {
+        int status = 0;
+
+        // wait for any child in this process group
+        pid_t w = waitpid(-pgid, &status, WUNTRACED);
+
+        if (w < 0) {
+            if (errno == EINTR) {
+                // interrupted by signal, retry
+                continue;
+            }
+            std::cerr << "waitpid: " << std::strerror(errno) << "\n";
+            return 1;
+        }
+
+        // child stopped
+        if (WIFSTOPPED(status)) {
+            stopped_out = true;
+            return 2;
+        }
+
+        // child exited: remove it from pid list
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            for (size_t i = 0; i < pids.size(); i++) {
+                if (pids[i] == (int)w) {
+                    pids.erase(pids.begin() + i);
+                    break;
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+// run a single command
+int run_command(const Command& cmd, bool background) {
     if (cmd.argv.empty()) {
         std::cerr << "myshell: empty command\n";
         return 1;
     }
 
-    // fork to create a child process
+    // build a display string for job table
+    std::string cmd_display;
+    for (size_t i = 0; i < cmd.argv.size(); i++) {
+        if (i) cmd_display += " ";
+        cmd_display += cmd.argv[i];
+    }
+
     pid_t pid = fork();
 
-    // if fork fails
     if (pid < 0) {
         std::cerr << "fork: " << std::strerror(errno) << "\n";
         return 1;
     }
 
-    // child process
+    // child
     if (pid == 0) {
-        // put child into its own process group (pgid = child pid)
-        // setpgid(0,0) makes this child a process group leader
+        // create process group (pgid = pid)
         if (setpgid(0, 0) < 0) {
-            // if this fails, job control may be limited, but try to continue
             std::cerr << "setpgid: " << std::strerror(errno) << "\n";
         }
+
+        // restore default signal behavior for the child
+        std::signal(SIGINT, SIG_DFL);
+        std::signal(SIGTSTP, SIG_DFL);
+        std::signal(SIGCHLD, SIG_DFL);
 
         // apply <
         if (cmd.has_stdin()) {
@@ -568,11 +688,8 @@ int run_command(const Command& cmd, bool background, int* out_pid, int* out_pgid
         // apply > or >>
         if (cmd.has_stdout()) {
             int flags = O_WRONLY | O_CREAT;
-            if (cmd.append) {
-                flags |= O_APPEND;
-            } else {
-                flags |= O_TRUNC;
-            }
+            if (cmd.append) flags |= O_APPEND;
+            else flags |= O_TRUNC;
 
             int fd = open(cmd.stdout_file.c_str(), flags, 0644);
             if (fd < 0) {
@@ -587,72 +704,71 @@ int run_command(const Command& cmd, bool background, int* out_pid, int* out_pgid
             close(fd);
         }
 
-        // build argv and exec
         std::vector<char*> argv = build_exec_argv(cmd);
         execvp(argv[0], argv.data());
 
-        // exec failed
         std::cerr << cmd.argv[0] << ": " << std::strerror(errno) << "\n";
         _exit(127);
     }
 
-    // parent process
-    // update 6: put child into its own process group (race-safe: do it in parent too)
-    if (setpgid(pid, pid) < 0) {
-        // if this fails, job control may be limited, but continue
-        // EACCES can happen if child execs very fast; this is often benign
-    }
-
-    // update 6: pgid for this job is pid
+    // parent: set process group defensively
+    setpgid(pid, pid);
     pid_t pgid = pid;
 
-    if (out_pid) *out_pid = static_cast<int>(pid);
-    if (out_pgid) *out_pgid = static_cast<int>(pgid);
-
-    // background: do not wait, add job and return
+    // background: add to jobs and return immediately
     if (background) {
         std::vector<int> pids;
-        pids.push_back(static_cast<int>(pid));
+        pids.push_back((int)pid);
 
-        // build display string
-        std::string cmd_display;
-        for (size_t i = 0; i < cmd.argv.size(); i++) {
-            if (i) cmd_display += " ";
-            cmd_display += cmd.argv[i];
-        }
-
-        add_job(pgid, pids, cmd_display);
+        int job_id = add_job(pgid, pids, cmd_display, JobState::RUNNING);
+        print_job_started(job_id, pgid);
         return 0;
     }
 
-    // foreground: give terminal to job, wait, then reclaim terminal
+    // foreground: give terminal, set fg pgid for signal forwarding, wait, reclaim
     give_terminal_to(pgid);
+    g_fg_pgid = (sig_atomic_t)pgid;
 
-    int rc = wait_for_child(pid);
+    std::vector<int> pids;
+    pids.push_back((int)pid);
 
+    bool stopped = false;
+    int rc = wait_for_foreground_job(pgid, pids, stopped);
+
+    // clear foreground pgid and reclaim terminal
+    g_fg_pgid = 0;
     reclaim_terminal();
+
+    // if stopped, add to job table as STOPPED
+    if (stopped) {
+        std::vector<int> still_alive;
+        still_alive.push_back((int)pid);
+
+        int job_id = add_job(pgid, still_alive, cmd_display, JobState::STOPPED);
+        std::cout << "[" << job_id << "] Stopped  " << cmd_display << "\n";
+        return 0;
+    }
+
     return rc;
 }
 
-int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* out_pids, int* out_pgid) {
-    // if pipeline is empty then return
+// run a pipeline
+int run_pipeline(const CommandLine& cmdline, bool background) {
     if (cmdline.pipeline.empty()) return 0;
 
     size_t n = cmdline.pipeline.size();
 
-    // single command pipeline just runs command logic
-    if (n == 1) {
-        int pid = -1;
-        int pgid = -1;
-        int rc = run_command(cmdline.pipeline[0], background, &pid, &pgid);
-        if (out_pids) out_pids->assign(1, pid);
-        if (out_pgid) *out_pgid = pgid;
-        return rc;
+    // build display string for job table
+    std::string cmd_display;
+    for (size_t i = 0; i < cmdline.pipeline.size(); i++) {
+        if (i) cmd_display += " | ";
+        for (size_t k = 0; k < cmdline.pipeline[i].argv.size(); k++) {
+            if (k) cmd_display += " ";
+            cmd_display += cmdline.pipeline[i].argv[k];
+        }
     }
 
-    // validate end-redirection rules:
-    // - only first command can have stdin redirection
-    // - only last command can have stdout redirection
+    // validate redirection rules
     for (size_t i = 0; i < n; i++) {
         if (i != 0 && cmdline.pipeline[i].has_stdin()) {
             std::cerr << "myshell: input redirection only allowed on first pipeline stage\n";
@@ -664,20 +780,14 @@ int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* 
         }
     }
 
-    // store child pids for waiting / job table
     std::vector<int> pids;
-
-    // process group id for the entire pipeline (set after first fork)
     pid_t pgid = -1;
 
-    // previous pipe read end
     int prev_read = -1;
 
-    // create each stage
     for (size_t i = 0; i < n; i++) {
         int pipefd[2] = {-1, -1};
 
-        // last stage does not need a pipe
         if (i < n - 1) {
             if (pipe(pipefd) < 0) {
                 std::cerr << "pipe: " << std::strerror(errno) << "\n";
@@ -692,21 +802,23 @@ int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* 
             return 1;
         }
 
-        // child process
+        // child
         if (pid == 0) {
-            // set process group for this stage
-            // first stage becomes the group leader
+            // first stage becomes process group leader, later stages join pgid
             if (i == 0) {
-                // make this child its own process group leader
                 if (setpgid(0, 0) < 0) {
                     std::cerr << "setpgid: " << std::strerror(errno) << "\n";
                 }
             } else {
-                // join existing process group
                 if (setpgid(0, pgid) < 0) {
                     std::cerr << "setpgid: " << std::strerror(errno) << "\n";
                 }
             }
+
+            // restore default signal behavior for the child
+            std::signal(SIGINT, SIG_DFL);
+            std::signal(SIGTSTP, SIG_DFL);
+            std::signal(SIGCHLD, SIG_DFL);
 
             // connect stdin from previous pipe
             if (i > 0) {
@@ -747,11 +859,8 @@ int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* 
             // apply output redirection on last stage
             if (i == n - 1 && cmdline.pipeline[i].has_stdout()) {
                 int flags = O_WRONLY | O_CREAT;
-                if (cmdline.pipeline[i].append) {
-                    flags |= O_APPEND;
-                } else {
-                    flags |= O_TRUNC;
-                }
+                if (cmdline.pipeline[i].append) flags |= O_APPEND;
+                else flags |= O_TRUNC;
 
                 int fd = open(cmdline.pipeline[i].stdout_file.c_str(), flags, 0644);
                 if (fd < 0) {
@@ -766,94 +875,86 @@ int run_pipeline(const CommandLine& cmdline, bool background, std::vector<int>* 
                 close(fd);
             }
 
-            // exec command
-            const Command& cmd = cmdline.pipeline[i];
-            if (cmd.argv.empty()) {
+            // exec stage command
+            const Command& c = cmdline.pipeline[i];
+            if (c.argv.empty()) {
                 std::cerr << "myshell: empty command\n";
                 _exit(1);
             }
 
-            std::vector<char*> argv = build_exec_argv(cmd);
+            std::vector<char*> argv = build_exec_argv(c);
             execvp(argv[0], argv.data());
 
-            std::cerr << cmd.argv[0] << ": " << std::strerror(errno) << "\n";
+            std::cerr << c.argv[0] << ": " << std::strerror(errno) << "\n";
             _exit(127);
         }
 
-        // parent process
-        // after first fork, establish pgid as first child's pid
+        // parent
         if (i == 0) {
             pgid = pid;
         }
 
-        // set process group from parent side too (race-safe)
-        if (setpgid(pid, pgid) < 0) {
-            // benign failures can happen if child execs fast
-        }
+        // set process group defensively
+        setpgid(pid, pgid);
 
-        pids.push_back(static_cast<int>(pid));
+        pids.push_back((int)pid);
 
-        // parent closes previous read end
         if (prev_read != -1) {
             close(prev_read);
             prev_read = -1;
         }
 
-        // parent keeps read end for next stage
         if (i < n - 1) {
             close(pipefd[1]);
             prev_read = pipefd[0];
         }
     }
 
-    // close any leftover pipe read end
     if (prev_read != -1) {
         close(prev_read);
         prev_read = -1;
     }
 
-    if (out_pids) {
-        *out_pids = pids;
-    }
-    if (out_pgid) {
-        *out_pgid = static_cast<int>(pgid);
-    }
-
-    // background: do not wait, add job and return
+    // background pipeline: add to job table and return immediately
     if (background) {
-        // build a display string for pipeline
-        std::string cmd_display;
-        for (size_t i = 0; i < cmdline.pipeline.size(); i++) {
-            if (i) cmd_display += " | ";
-            for (size_t k = 0; k < cmdline.pipeline[i].argv.size(); k++) {
-                if (k) cmd_display += " ";
-                cmd_display += cmdline.pipeline[i].argv[k];
-            }
-        }
-
-        add_job(pgid, pids, cmd_display);
+        int job_id = add_job(pgid, pids, cmd_display, JobState::RUNNING);
+        print_job_started(job_id, pgid);
         return 0;
     }
 
-    // foreground: give terminal to job process group, wait for all, reclaim terminal
+    // foreground pipeline: give terminal, set fg pgid, wait, reclaim
     give_terminal_to(pgid);
+    g_fg_pgid = (sig_atomic_t)pgid;
 
-    int last_status = 0;
-    for (size_t i = 0; i < pids.size(); i++) {
-        int rc = wait_for_child(pids[i]);
-        if (i == pids.size() - 1) {
-            last_status = rc;
-        }
+    bool stopped = false;
+    int rc = wait_for_foreground_job(pgid, pids, stopped);
+
+    g_fg_pgid = 0;
+    reclaim_terminal();
+
+    // if stopped, add remaining pids as STOPPED job
+    if (stopped) {
+        int job_id = add_job(pgid, pids, cmd_display, JobState::STOPPED);
+        std::cout << "[" << job_id << "] Stopped  " << cmd_display << "\n";
+        return 0;
     }
 
-    reclaim_terminal();
-    return last_status;
+    return rc;
 }
 
 
-// not used anymore, legacy for simple commands
+
+// none of these are used anymore
+std::vector<char*> build_argv(const std::vector<std::string>& tokens) {
+    std::vector<char*> argv;
+    for (const std::string& s : tokens) {
+        argv.push_back(const_cast<char*>(s.c_str()));
+    }
+    argv.push_back(nullptr);
+    return argv;
+}
+
 int run_external(const std::vector<std::string>& tokens) {
-    // if empty return
     if (tokens.empty()) return 0;
 
     pid_t pid = fork();
@@ -871,5 +972,15 @@ int run_external(const std::vector<std::string>& tokens) {
         _exit(127);
     }
 
-    return wait_for_child(pid);
+    int status = 0;
+    while (true) {
+        pid_t w = waitpid(pid, &status, 0);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            std::cerr << "waitpid: " << std::strerror(errno) << "\n";
+            return 1;
+        }
+        break;
+    }
+    return 0;
 }

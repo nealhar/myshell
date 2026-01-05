@@ -1,11 +1,13 @@
 # myshell
 
 A Unix-like shell implemented in C++, developed incrementally with a focus on
-systems programming fundamentals: process creation, program execution, and
-Unix job control. The project is built and tested on Linux using WSL and is
+systems programming fundamentals: process creation, program execution, pipelines,
+and Unix job control. The project is built and tested on Linux using WSL and is
 structured to grow into a feature-complete “mini-bash.”
 
 ## Current Status
+
+**Update 7 complete (signals + asynchronous child reaping)**
 
 The shell currently supports:
 - An interactive read–eval–print loop
@@ -16,15 +18,16 @@ The shell currently supports:
 - Input/output redirection using `open` + `dup2`
 - Pipelines of arbitrary length using `pipe` + `dup2`
 - Background execution for both single commands and pipelines
-- A job table tracking background jobs (job id, pgid, pids, command string, state)
-- Foreground job execution using process groups and terminal control (`setpgid`, `tcsetpgrp`)
-- Non-blocking reaping of background children using `waitpid(..., WNOHANG)`
+- Per-job process groups with terminal control for foreground jobs (`setpgid`, `tcsetpgrp`)
+- Signal handling for interactive behavior:
+  - `SIGCHLD` triggers asynchronous child reaping
+  - `SIGINT` (Ctrl-C) forwards to the foreground process group
+  - `SIGTSTP` (Ctrl-Z) forwards to the foreground process group
+- Job table with basic state tracking (`Running`, `Stopped`, `Done`)
 - Clean build system using `make`
 
-> Note: Background job completion is detected via polling at the start of each
-> shell loop iteration. Job completion messages may appear when the shell
-> regains control (e.g., after pressing Enter). Asynchronous signal-driven
-> reaping will be implemented in a later update.
+> Note: This update focuses on correct signal delivery and prompt responsiveness.
+> Full `fg/bg` job control semantics are planned for the next milestone.
 
 ---
 
@@ -43,7 +46,7 @@ The shell currently supports:
 - Detects and reports basic syntax errors (e.g., missing command, missing redirection filename)
 
 ### Redirection Execution
-- Executes a single parsed command with I/O redirection:
+- Executes commands with I/O redirection:
   - `cmd < input.txt`
   - `cmd > output.txt`
   - `cmd >> output.txt`
@@ -57,37 +60,39 @@ The shell currently supports:
   - `cmd1 | cmd2`
   - `cmd1 | cmd2 | cmd3`
 - Creates `N-1` pipes for `N` stages and forks one process per stage
-- Connects pipeline stages using `dup2()`:
-  - stage `i` stdout → pipe write end
-  - stage `i+1` stdin → pipe read end
-- Closes unused pipe file descriptors in both parent and child processes to
-  ensure correct EOF behavior
+- Connects stages using `dup2()` and closes unused pipe fds to ensure correct EOF propagation
 - Supports end redirection on pipelines under simplified rules:
   - `< file` only on the first stage
   - `> file` / `>> file` only on the last stage
 
-### Background Jobs
-- Supports background execution with `&`:
-  - `sleep 5 &`
-  - `cmd1 | cmd2 &`
-- Shell does not block on background jobs
-- Maintains a job table tracking:
-  - job id
-  - process group id (pgid)
-  - process ids
-  - original command string
-  - running/done state
-- Includes a `jobs` builtin to list background jobs
-
 ### Process Groups + Terminal Control
-- Each command or pipeline runs in its own process group
+- Each command/pipeline runs in its own process group (PGID)
 - Foreground jobs:
   - receive terminal control via `tcsetpgrp()`
-  - run isolated from the shell
-  - return terminal control to the shell on completion
+  - return terminal control to the shell upon completion/stop
 - Background jobs:
-  - run in separate process groups
+  - run in their own process group
   - do not receive terminal control
-- Shell runs in its own process group and ignores terminal job-control signals
-  (`SIGTTOU`, `SIGTTIN`, `SIGTSTP`) to prevent self-stopping
+
+### Signals + Asynchronous Reaping
+- Uses `sigaction()` to install signal handlers with predictable behavior
+- `SIGCHLD`:
+  - triggers non-blocking reaping with `waitpid(..., WNOHANG | WUNTRACED | WCONTINUED)`
+  - allows background completion messages to appear promptly (without waiting for the next command)
+- `SIGINT` (Ctrl-C):
+  - forwarded to the foreground process group so the running job is interrupted, not the shell
+- `SIGTSTP` (Ctrl-Z):
+  - forwarded to the foreground process group so the job stops and returns control to the shell
+
+### Background Jobs + Job Table
+- Supports background execution with `&`:
+  - `sleep 2 &`
+  - `cmd1 | cmd2 &`
+- Tracks jobs with:
+  - job id
+  - pgid
+  - pids
+  - command string
+  - state (`Running`, `Stopped`, `Done`)
+- `jobs` builtin lists the current job table
 
