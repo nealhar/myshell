@@ -16,17 +16,13 @@ OBJ := $(SRC:.cpp=.o)
 # compiler flags, use C++ 20, enable warnings and include debugging
 CXXFLAGS := -std=c++20 -Wall -Wextra -Wpedantic -g
 
-
-# no linking flags yet
-LDFLAGS :=
-
 # target is myshell
 all: $(TARGET)
 
 
 # link object files into executable
 $(TARGET): $(OBJ)
-	$(CXX) $(CXXFLAGS) $(OBJ) -o $@ $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) $(OBJ) -o $@
 
 # compile cpp into object files
 %.o: %.cpp myshell.hpp

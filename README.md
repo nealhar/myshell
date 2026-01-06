@@ -1,94 +1,90 @@
 # myshell
 
-A Unix-like shell implemented in C++, developed incrementally with a focus on
-systems programming fundamentals: process creation, program execution, I/O
-redirection, pipelines, and Unix job control. The project is built and tested
-on Linux using WSL and is structured to grow into a feature-complete “mini-bash”
-with correct process group and terminal semantics.
+A Unix-like shell implemented in C++, developed incrementally with a focus on core
+systems programming concepts: process creation, program execution, pipes, file
+descriptor management, and POSIX job control. The project is built and tested on
+Linux via WSL and is being extended toward a feature-complete “mini-bash” with
+correct foreground/background semantics and interactive signal handling.
 
 ## Current Status
 
-**Update 8 complete (fg/bg job control builtins)**
-
 The shell currently supports:
-- An interactive read–eval–print loop
+- Interactive read–eval–print loop (REPL)
 - Operator-aware tokenization for: `|`, `<`, `>`, `>>`, `&`
-- Parsing into a structured command model (pipeline stages + redirection metadata + background flag)
-- Builtin commands: `cd`, `exit`, `jobs`, `fg`, `bg`
-- Execution of external commands using `fork`, `execvp`, and `waitpid`
-- Input/output redirection for single commands and pipelines using `open` + `dup2`:
+- Parsing into a structured command model:
+  - pipeline stages
+  - per-stage redirection metadata
+  - background flag (`&`)
+- Builtin commands:
+  - `cd`, `exit`
+  - `jobs`, `fg`, `bg`
+- External command execution using `fork()`, `execvp()`, and `waitpid()`
+- I/O redirection using `open()` + `dup2()`:
   - stdin redirection: `<`
   - stdout redirection: `>`
   - stdout append: `>>`
-- Pipelines of arbitrary length using `pipe` + `dup2`
-- Background execution (`&`) with a job table
-- Process groups and terminal control (`setpgid`, `tcsetpgrp`) for correct interactive behavior
-- Signal handling:
-  - `SIGCHLD` for asynchronous child reaping (background completion notices appear without new input)
-  - `SIGINT` / `SIGTSTP` forwarded to the foreground process group (Ctrl-C / Ctrl-Z)
-- Foreground/background job control:
-  - `fg` brings a job to the foreground and hands it the terminal
-  - `bg` resumes a stopped job in the background
+- Pipelines of arbitrary length using `pipe()` + `dup2()`
+- Background jobs with a job table and asynchronous reaping (`SIGCHLD`, `WNOHANG`)
+- Process groups and terminal control (`setpgid`, `tcsetpgrp`)
+- Interactive signal behavior:
+  - `Ctrl-C` (SIGINT) and `Ctrl-Z` (SIGTSTP) forwarded to the foreground job
+  - the shell stays alive and regains terminal ownership correctly
+
+---
 
 ## Features (Implemented)
 
 ### Interactive Shell
 - Displays a prompt and reads user input line-by-line
-- Exits cleanly on EOF (`Ctrl-D`) or `exit`
+- Exits on EOF (`Ctrl-D`) or `exit`
 
 ### Tokenization + Parsing
-- Recognizes operators as separate tokens (including `>>` as one token)
+- Recognizes operators as separate tokens (including `>>` as a single token)
 - Parses command lines into a structured model:
-  - pipeline of command stages
-  - per-stage redirection fields (`<`, `>`, `>>`)
-  - trailing background indicator (`&`)
-- Detects and reports basic syntax errors (e.g., missing command, missing redirection filename)
+  - `CommandLine.pipeline` (vector of `Command`)
+  - redirection fields per stage
+  - `CommandLine.background` for `&`
+- Detects and reports common syntax errors (missing command, missing redirection filename, etc.)
 
-### Redirection Execution
+### Redirection
 - Executes commands with I/O redirection:
   - `cmd < input.txt`
   - `cmd > output.txt`
   - `cmd >> output.txt`
-- Implements redirection in the child process prior to `execvp()`:
-  - opens files with `open()`
-  - rewires file descriptors with `dup2()`
-  - closes original descriptors after duplication
-- Reports file/permission errors cleanly and returns to the prompt
+- Implements redirection in the child process before `execvp()` using `open()` and `dup2()`
 
 ### Pipelines
-- Executes pipelines of arbitrary length:
+- Supports pipelines of arbitrary length:
   - `a | b | c`
-- Connects stages using `pipe()` and `dup2()`:
-  - previous stage stdout → next stage stdin
-- Supports redirection with pipelines:
-  - input redirection allowed only on the first stage
-  - output redirection allowed only on the last stage
+- Connects stdout of stage `i` to stdin of stage `i+1` using `pipe()` and `dup2()`
+- Ensures correct closing of unused pipe ends in both parent and child
 
 ### Background Jobs + Job Table
-- Runs commands/pipelines in the background with `&`
-- Stores jobs in a job table with:
-  - job id
+- Supports background execution using `&`:
+  - `sleep 5 &`
+- Stores background/stopped jobs in a job table with:
+  - job id (`[1]`, `[2]`, ...)
   - process group id (pgid)
-  - tracked pids (for pipelines)
-  - state (RUNNING/STOPPED/DONE)
-- `jobs` prints job status
+  - command string
+  - state: Running / Stopped
+- Asynchronously reaps finished jobs via `SIGCHLD` + `waitpid(WNOHANG)` and prints completion notifications
 
-### Job Control (`fg` / `bg`)
+### Job Control (`jobs`, `fg`, `bg`)
+- `jobs` prints current job table with `+` (current) and `-` (previous) markers
 - `fg [%job]`:
-  - transfers terminal control to the job’s process group (`tcsetpgrp`)
-  - resumes the job with `SIGCONT` (if stopped)
-  - waits until job stops or completes
+  - gives terminal control to the job’s process group
+  - resumes the job (`SIGCONT`) if needed
+  - waits in the foreground until the job stops or finishes
 - `bg [%job]`:
-  - resumes a stopped job in the background using `SIGCONT`
-  - does not take terminal control
-- Job id formats supported:
-  - `fg %1`, `fg 1`, `bg %2`, `bg 2`
-- Default behavior:
-  - `fg` with no args selects the most recent STOPPED job (or most recent RUNNING job if none stopped)
-  - `bg` with no args selects the most recent STOPPED job
+  - resumes a stopped job in the background (`SIGCONT`)
+  - keeps the shell interactive
 
-### Signal Handling
-- `SIGCHLD` triggers non-blocking reaping (`waitpid` with `WNOHANG|WUNTRACED|WCONTINUED`)
-- Background job completion messages appear asynchronously (no need to run a new command)
-- Ctrl-C (`SIGINT`) and Ctrl-Z (`SIGTSTP`) are forwarded to the foreground process group
+### Terminal Control + Signals
+- The shell runs in its own process group and owns the terminal
+- Foreground jobs are placed into their own process group and temporarily receive terminal ownership
+- `SIGINT` and `SIGTSTP` are forwarded to the current foreground process group
+- `SIGCHLD` triggers asynchronous reaping so background job completion is reported without requiring another command
 
+### Build & Run
+make
+./myshell

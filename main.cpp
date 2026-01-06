@@ -36,7 +36,7 @@ int main()
             continue;
         }
 
-        // reap after returning from input as well (covers signal timing)
+        // reap after returning from input as well
         reap_children();
 
         // tokenize the line and keep operators
@@ -50,8 +50,7 @@ int main()
 
         // if the command is built in then run it in the shell process
         // builtins run in the shell process because they must modify shell state (like cd)
-        if (is_builtin(tokens))
-        {
+        if (is_builtin(tokens)) {
             int rc = run_builtin(tokens);
 
             // if it exits then return -1 to break out of loop
@@ -74,12 +73,10 @@ int main()
         }
 
         // run pipeline or single command
-        if (cmdline.is_pipeline())
-        {
+        if (cmdline.is_pipeline()) {
             run_pipeline(cmdline, cmdline.background);
         }
-        else
-        {
+        else {
             if (cmdline.pipeline.empty())
             {
                 std::cerr << "myshell: internal error: no command to run\n";

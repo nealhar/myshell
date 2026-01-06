@@ -13,8 +13,6 @@ void print_prompt();
 // returns true with line="" if interrupted by signal (EINTR) so loop can reap + re-prompt
 bool read_line(std::string& line);
 
-// splits input line by whitespace into tokens -- not used anymore
-std::vector<std::string> tokenize_whitespace(const std::string& line);
 
 // splits input line into tokens while preserving operators
 std::vector<std::string> tokenize_operators(const std::string& line);
@@ -27,21 +25,21 @@ void init_shell_signals();
 
 // describes one command in a pipeline
 class Command {
-public:
+    public:
     // argv is the argument vector, argv[0] is the program name
     std::vector<std::string> argv;
-
+    
     // input redirection file (for "<")
     // empty means no redirection specified
     std::string stdin_file;
-
+    
     // output redirection file (for ">" or ">>")
     // empty means no redirection specified
     std::string stdout_file;
-
+    
     // true if output uses append (">>"), false if truncate (">")
     bool append = false;
-
+    
     // helper methods
     bool has_stdin() const;
     bool has_stdout() const;
@@ -49,20 +47,20 @@ public:
 
 // describes a full command line
 class CommandLine {
-public:
+    public:
     // list of commands separated by pipes
     std::vector<Command> pipeline;
 
     // true if trailing '&' was present
     bool background = false;
-
+    
     // helper method
     bool is_pipeline() const;
 };
 
-// parses tokens into a structured CommandLine
-// returns true if parse succeeded, false if syntax error
-// on error, err_msg contains a human readable message
+/* parses tokens into a structured CommandLine
+ returns true if parse succeeded, false if syntax error
+ on error, err_msg contains a human readable message*/
 bool parse_command_line(const std::vector<std::string>& tokens, CommandLine& out, std::string& err_msg);
 
 // helper to detect if operators are present
@@ -82,11 +80,16 @@ int run_command(const Command& cmd, bool background);
 // if background == true, shell does not wait
 int run_pipeline(const CommandLine& cmdline, bool background);
 
-// legacy -- does not support redirection
-int run_external(const std::vector<std::string>& tokens);
-
 // reap any finished/stopped/continued children
 void reap_children();
 
-// builds argv array for execvp, must be null terminated
+//////////////////////////////////////////////////////
+// legacy methods, used in older versions, not anymore
+// splits input line by whitespace into tokens -- not used anymore
+std::vector<std::string> tokenize_whitespace(const std::string& line);
+
+// legacy -- does not support redirection
+int run_external(const std::vector<std::string>& tokens);
+
+// legacy -- builds argv array for execvp, must be null terminated
 std::vector<char*> build_argv(const std::vector<std::string>& tokens);
