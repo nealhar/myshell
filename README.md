@@ -86,5 +86,7 @@ The shell currently supports:
 - `SIGCHLD` triggers asynchronous reaping so background job completion is reported without requiring another command
 
 ### Build & Run
+### Build & Run
+```sh
 make
 ./myshell
