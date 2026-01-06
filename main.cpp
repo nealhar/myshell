@@ -15,7 +15,6 @@ int main()
     // infinite loop
     while (true)
     {
-
         // reap any child status changes before showing prompt
         reap_children();
 

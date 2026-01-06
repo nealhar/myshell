@@ -3,6 +3,7 @@
 #include "myshell.hpp"
 
 #include <cerrno>
+#include <cctype>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -14,7 +15,6 @@
 #include <csignal>
 #include <signal.h>
 #include <sys/select.h>
-
 
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -31,7 +31,6 @@ static volatile sig_atomic_t g_sigchld_flag = 0;
 
 // current foreground process group id (0 or -1 means no foreground job)
 static volatile sig_atomic_t g_fg_pgid = 0;
-
 
 static void give_terminal_to(pid_t pgid) {
     // only do this for interactive terminals
@@ -51,7 +50,6 @@ static void reclaim_terminal() {
         std::cerr << "tcsetpgrp: " << std::strerror(errno) << "\n";
     }
 }
-
 
 // initialize shell process group and attach to terminal
 void init_shell_job_control() {
@@ -77,7 +75,6 @@ void init_shell_job_control() {
     std::signal(SIGTTOU, SIG_IGN);
     std::signal(SIGTTIN, SIG_IGN);
 }
-
 
 enum class JobState {
     RUNNING,
@@ -162,6 +159,55 @@ static void print_jobs() {
     }
 }
 
+// helper: find a job index by job id
+static int find_job_index_by_id(int job_id) {
+    for (size_t i = 0; i < g_jobs.size(); i++) {
+        if (g_jobs[i].job_id == job_id) return (int)i;
+    }
+    return -1;
+}
+
+// helper: parse a job id token ("%3" or "3")
+// returns true if parsed, false otherwise
+static bool parse_job_id_token(const std::string& tok, int& out_id) {
+    std::string s = tok;
+
+    // allow leading %
+    if (!s.empty() && s[0] == '%') {
+        s.erase(s.begin());
+    }
+
+    if (s.empty()) return false;
+
+    // must be all digits
+    for (char c : s) {
+        if (!std::isdigit((unsigned char)c)) return false;
+    }
+
+    out_id = std::stoi(s);
+    return true;
+}
+
+// helper: choose default job for fg
+// prefer most recent STOPPED job; if none, most recent RUNNING job
+static int pick_default_job_for_fg() {
+    for (int i = (int)g_jobs.size() - 1; i >= 0; i--) {
+        if (g_jobs[i].state == JobState::STOPPED) return i;
+    }
+    for (int i = (int)g_jobs.size() - 1; i >= 0; i--) {
+        if (g_jobs[i].state == JobState::RUNNING) return i;
+    }
+    return -1;
+}
+
+// helper: choose default job for bg
+// prefer most recent STOPPED job
+static int pick_default_job_for_bg() {
+    for (int i = (int)g_jobs.size() - 1; i >= 0; i--) {
+        if (g_jobs[i].state == JobState::STOPPED) return i;
+    }
+    return -1;
+}
 
 // SIGCHLD handler: just set a flag
 static void sigchld_handler(int) {
@@ -242,7 +288,6 @@ void init_shell_signals() {
     std::signal(SIGQUIT, SIG_IGN);
 }
 
-
 void print_prompt() {
     // print prompt and flush output so it appears immediately
     std::cout << "myshell> " << std::flush;
@@ -291,7 +336,6 @@ bool read_line(std::string& line) {
         line.push_back(c);
     }
 }
-
 
 std::vector<std::string> tokenize_whitespace(const std::string& line) {
     std::istringstream iss(line);
@@ -477,53 +521,6 @@ bool parse_command_line(const std::vector<std::string>& tokens, CommandLine& out
     return true;
 }
 
-
-bool is_builtin(const std::vector<std::string>& tokens) {
-    if (tokens.empty()) return false;
-    return (tokens[0] == "cd" || tokens[0] == "exit" || tokens[0] == "jobs");
-}
-
-static int builtin_cd(const std::vector<std::string>& tokens) {
-    const char* target = nullptr;
-
-    if (tokens.size() >= 2) {
-        target = tokens[1].c_str();
-    } else {
-        target = std::getenv("HOME");
-        if (!target) {
-            std::cerr << "cd: HOME not set\n";
-            return 1;
-        }
-    }
-
-    if (chdir(target) != 0) {
-        std::cerr << "cd: " << std::strerror(errno) << "\n";
-        return 1;
-    }
-
-    return 0;
-}
-
-int run_builtin(const std::vector<std::string>& tokens) {
-    if (tokens.empty()) return 0;
-
-    if (tokens[0] == "exit") {
-        return -1;
-    }
-
-    if (tokens[0] == "cd") {
-        return builtin_cd(tokens);
-    }
-
-    if (tokens[0] == "jobs") {
-        print_jobs();
-        return 0;
-    }
-
-    std::cerr << "Unknown builtin\n";
-    return 1;
-}
-
 // helper: build argv for execvp from Command.argv
 static std::vector<char*> build_exec_argv(const Command& cmd) {
     std::vector<char*> argv;
@@ -595,7 +592,7 @@ void reap_children() {
 
 // wait for a foreground process group until it either finishes or stops
 // returns:
-// - 0 if job finished normally (at least one child exited)
+// - 0 if job finished
 // - 2 if job stopped (Ctrl-Z)
 // - 1 on error
 static int wait_for_foreground_job(pid_t pgid, std::vector<int>& pids, bool& stopped_out) {
@@ -635,6 +632,189 @@ static int wait_for_foreground_job(pid_t pgid, std::vector<int>& pids, bool& sto
     }
 
     return 0;
+}
+
+bool is_builtin(const std::vector<std::string>& tokens) {
+    if (tokens.empty()) return false;
+
+    // add fg/bg builtins for job control
+    return (tokens[0] == "cd" || tokens[0] == "exit" || tokens[0] == "jobs" ||
+            tokens[0] == "fg" || tokens[0] == "bg");
+}
+
+static int builtin_cd(const std::vector<std::string>& tokens) {
+    const char* target = nullptr;
+
+    if (tokens.size() >= 2) {
+        target = tokens[1].c_str();
+    } else {
+        target = std::getenv("HOME");
+        if (!target) {
+            std::cerr << "cd: HOME not set\n";
+            return 1;
+        }
+    }
+
+    if (chdir(target) != 0) {
+        std::cerr << "cd: " << std::strerror(errno) << "\n";
+        return 1;
+    }
+
+    return 0;
+}
+
+// bring a job into the foreground
+static int builtin_fg(const std::vector<std::string>& tokens) {
+    // choose target job
+    int job_index = -1;
+
+    // fg with argument: fg %1 or fg 1
+    if (tokens.size() >= 2) {
+        int job_id = 0;
+        if (!parse_job_id_token(tokens[1], job_id)) {
+            std::cerr << "fg: invalid job id\n";
+            return 1;
+        }
+
+        job_index = find_job_index_by_id(job_id);
+        if (job_index < 0) {
+            std::cerr << "fg: no such job\n";
+            return 1;
+        }
+    } else {
+        // fg with no args: pick default
+        job_index = pick_default_job_for_fg();
+        if (job_index < 0) {
+            std::cerr << "fg: no current job\n";
+            return 1;
+        }
+    }
+
+    Job& j = g_jobs[job_index];
+
+    // cannot foreground a job that is already done
+    if (j.state == JobState::DONE) {
+        std::cerr << "fg: job is already done\n";
+        return 1;
+    }
+
+    // print the command like bash does when you fg something
+    std::cout << j.cmd << "\n";
+
+    // give terminal to the job's process group
+    give_terminal_to(j.pgid);
+
+    // set foreground pgid for signal forwarding
+    g_fg_pgid = (sig_atomic_t)j.pgid;
+
+    // continue the job if it was stopped
+    // negative pid sends to the process group
+    if (kill(-j.pgid, SIGCONT) < 0) {
+        std::cerr << "kill(SIGCONT): " << std::strerror(errno) << "\n";
+    }
+
+    // mark running
+    j.state = JobState::RUNNING;
+
+    // wait for the job in the foreground
+    bool stopped = false;
+    int rc = wait_for_foreground_job(j.pgid, j.pids, stopped);
+
+    // clear foreground pgid and reclaim terminal
+    g_fg_pgid = 0;
+    reclaim_terminal();
+
+    // if stopped, keep it in job table as STOPPED
+    if (stopped) {
+        j.state = JobState::STOPPED;
+        std::cout << "[" << j.job_id << "] Stopped  " << j.cmd << "\n";
+        return 0;
+    }
+
+    // finished in foreground: remove it from job table
+    // (bash does not print a "Done" line for fg completion)
+    if (j.pids.empty()) {
+        g_jobs.erase(g_jobs.begin() + job_index);
+    }
+
+    return rc;
+}
+
+// resume a stopped job in the background
+static int builtin_bg(const std::vector<std::string>& tokens) {
+    int job_index = -1;
+
+    // bg with argument: bg %1 or bg 1
+    if (tokens.size() >= 2) {
+        int job_id = 0;
+        if (!parse_job_id_token(tokens[1], job_id)) {
+            std::cerr << "bg: invalid job id\n";
+            return 1;
+        }
+
+        job_index = find_job_index_by_id(job_id);
+        if (job_index < 0) {
+            std::cerr << "bg: no such job\n";
+            return 1;
+        }
+    } else {
+        // bg with no args: pick most recent stopped job
+        job_index = pick_default_job_for_bg();
+        if (job_index < 0) {
+            std::cerr << "bg: no current job\n";
+            return 1;
+        }
+    }
+
+    Job& j = g_jobs[job_index];
+
+    // bg is meaningful only for stopped jobs
+    if (j.state != JobState::STOPPED) {
+        std::cerr << "bg: job is not stopped\n";
+        return 1;
+    }
+
+    // continue the job in background
+    if (kill(-j.pgid, SIGCONT) < 0) {
+        std::cerr << "kill(SIGCONT): " << std::strerror(errno) << "\n";
+        return 1;
+    }
+
+    j.state = JobState::RUNNING;
+
+    // print running status like a real shell
+    std::cout << "[" << j.job_id << "] Running  " << j.cmd << "\n";
+
+    return 0;
+}
+
+int run_builtin(const std::vector<std::string>& tokens) {
+    if (tokens.empty()) return 0;
+
+    if (tokens[0] == "exit") {
+        return -1;
+    }
+
+    if (tokens[0] == "cd") {
+        return builtin_cd(tokens);
+    }
+
+    if (tokens[0] == "jobs") {
+        print_jobs();
+        return 0;
+    }
+
+    // Update 8: fg/bg job control builtins
+    if (tokens[0] == "fg") {
+        return builtin_fg(tokens);
+    }
+
+    if (tokens[0] == "bg") {
+        return builtin_bg(tokens);
+    }
+
+    std::cerr << "Unknown builtin\n";
+    return 1;
 }
 
 // run a single command
@@ -941,8 +1121,6 @@ int run_pipeline(const CommandLine& cmdline, bool background) {
 
     return rc;
 }
-
-
 
 // none of these are used anymore
 std::vector<char*> build_argv(const std::vector<std::string>& tokens) {
